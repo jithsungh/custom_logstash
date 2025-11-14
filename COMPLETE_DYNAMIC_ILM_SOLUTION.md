@@ -1,6 +1,6 @@
-# 🚀 Complete Dynamic ILM Solution - Summary
+# Edit #2 🚀 Complete Dynamic ILM Solution - Summary
 
-## ✅ What We've Built
+## ✅ What was built
 
 A complete solution for **per-container ILM management** with:
 
