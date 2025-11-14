@@ -294,23 +294,23 @@ The following are **NOT** included in this solution:
 ```
 Event Flow:
 ┌─────────────┐
-│   Event     │ container_name: "nginx"
+│   Event     │ container_name: "uibackend"
 │  Arrives    │
 └──────┬──────┘
        │
        ▼
 ┌─────────────────────────────┐
 │  Check Cache                │
-│  "nginx" created?           │
+│  "uibackend" created?           │
 └──────┬──────────────────────┘
        │
        ├─ YES → Index Event (fast path)
        │
        └─ NO  → Create Resources:
               ┌─────────────────────┐
-              │ 1. ILM Policy       │ nginx-ilm-policy
-              │ 2. Template         │ logstash-nginx
-              │ 3. Rollover Index   │ nginx-2025.11.15-000001
+              │ 1. ILM Policy       │ uibackend-ilm-policy
+              │ 2. Template         │ logstash-uibackend
+              │ 3. Rollover Index   │ uibackend-2025.11.15-000001
               └─────────────────────┘
               │
               ▼
@@ -340,7 +340,7 @@ Event Flow:
 
 - ✅ **No Field Conflicts:** Isolated templates per service
 - ✅ **Flexible Retention:** Customize per service needs
-- ✅ **Better Organization:** Clear index naming (`nginx-*`, `api-*`)
+- ✅ **Better Organization:** Clear index naming (`uibackend-*`, `api-*`)
 
 ### Business Benefits
 
@@ -369,7 +369,7 @@ Upon approval, the implementation will:
 
 | Version | Date       | Author      | Changes                       |
 | ------- | ---------- | ----------- | ----------------------------- |
-| 1.0     | 2025-11-15 | DevOps Team | Initial requirements document |
+| 1.0     | 2025-11-15 | SRE Team | Initial requirements document |
 
 ---
 
