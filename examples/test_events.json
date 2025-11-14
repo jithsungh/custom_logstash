@@ -1,0 +1,10 @@
+{"message": "Starting nginx service", "container_name": "nginx", "level": "info"}
+{"message": "Database connection established", "container_name": "postgres", "level": "info"}
+{"message": "Processing HTTP request", "container_name": "nginx", "level": "debug"}
+{"message": "Application started", "container_name": "app", "level": "info"}
+{"message": "Error connecting to backend", "container_name": "app", "level": "error"}
+{"message": "Query executed successfully", "container_name": "postgres", "level": "debug"}
+{"message": "Request completed in 45ms", "container_name": "nginx", "level": "info"}
+{"message": "Cache miss for key user:123", "container_name": "redis", "level": "warn"}
+{"message": "Worker thread started", "container_name": "app", "level": "info"}
+{"message": "SSL certificate renewal", "container_name": "nginx", "level": "warn"}
