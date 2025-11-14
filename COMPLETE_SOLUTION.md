@@ -1,10 +1,10 @@
 # Edit #1 Complete Solution Summary
 
-## 🎯 What You Asked For
+## 🎯 Whats the requirement
 
 > "I need one template per index, and single ILM policy (common_ilm_policy)"
 
-## ✅ What We Built
+## ✅ What Was Built
 
 A modified `logstash-output-elasticsearch` plugin that **automatically creates one template per container** while using a **single shared ILM policy**.
 
