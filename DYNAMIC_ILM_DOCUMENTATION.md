@@ -83,14 +83,14 @@ output {
 
 ## 🔄 What Happens at Runtime
 
-### First Event from Container "nginx"
+### First Event from Container "uibackend"
 
-1. ✅ Plugin creates ILM policy `nginx-ilm-policy` with your configured settings
-2. ✅ Plugin creates index template `logstash-nginx` matching `nginx-*`
-3. ✅ Plugin creates index `nginx-000001` with write alias `nginx`
-4. ✅ Event is indexed to `nginx-000001`
+1. ✅ Plugin creates ILM policy `uibackend-ilm-policy` with the configured settings
+2. ✅ Plugin creates index template `logstash-uibackend` matching `uibackend-*`
+3. ✅ Plugin creates index `uibackend-000001` with write alias `uibackend`
+4. ✅ Event is indexed to `uibackend-000001`
 
-### Subsequent Events from "nginx"
+### Subsequent Events from "uibackend"
 
 1. ✅ Plugin detects resources already exist (cached)
 2. ✅ Event is indexed directly (no overhead)
@@ -167,7 +167,7 @@ curl -X GET "eck-es-http:9200/_ilm/policy?pretty"
 
 You should see:
 
-- `nginx-ilm-policy`
+- `uibackend-ilm-policy`
 - `app1-ilm-policy`
 - `dotcms-ilm-policy`
 - etc.
@@ -180,7 +180,7 @@ curl -X GET "eck-es-http:9200/_index_template?pretty"
 
 You should see:
 
-- `logstash-nginx`
+- `logstash-uibackend`
 - `logstash-app1`
 - `logstash-dotcms`
 - etc.
@@ -193,7 +193,7 @@ curl -X GET "eck-es-http:9200/_cat/indices?v"
 
 You should see:
 
-- `nginx-000001`, `nginx-000002`, ...
+- `uibackend-000001`, `uibackend-000002`, ...
 - `app1-000001`, `app1-000002`, ...
 - `dotcms-000001`, `dotcms-000002`, ...
 
