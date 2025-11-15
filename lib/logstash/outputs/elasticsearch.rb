@@ -416,7 +416,10 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
   end
 
   MapEventsResult = Struct.new(:successful_events, :event_mapping_errors)
-  FailedEventMapping = Struct.new(:event, :message)  private
+  FailedEventMapping = Struct.new(:event, :message)
+  
+  private
+  
   def safe_interpolation_map_events(events)
     successful_events = [] # list of LogStash::Outputs::ElasticSearch::EventActionTuple
     event_mapping_errors = [] # list of FailedEventMapping
