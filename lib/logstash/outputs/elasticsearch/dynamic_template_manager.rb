@@ -12,31 +12,48 @@ module LogStash; module Outputs; class ElasticSearch
       return unless ilm_in_use?
       return unless @ilm_rollover_alias&.include?('%{')
       
-      # When using ILM with dynamic aliases, index_name IS the alias (e.g., "nginx", not "nginx-000001")
+      # When using ILM with dynamic aliases, index_name IS the alias (e.g., "uibackend", not "uibackend-000001")
       # because @index is set to @ilm_rollover_alias in setup_ilm
       alias_name = index_name
       
-      # Check cache - if already created, skip (resources exist in Elasticsearch)
+      # Check cache - if already created and verified, skip (resources exist in Elasticsearch)
       return if @dynamic_templates_created.get(alias_name)
       
       # Build resource names
       policy_name = "#{alias_name}-ilm-policy"
       template_name = "logstash-#{alias_name}"
       
-      # Create resources (idempotent - checks existence internally)
+      # CRITICAL: Create resources in correct order
+      # Step 1: Create ILM policy FIRST (must exist before index creation)
       ensure_ilm_policy_exists(policy_name, alias_name)
+      
+      # Step 2: Verify policy actually exists in Elasticsearch
+      # This is critical because Elasticsearch allows indices to reference non-existent policies
+      # without throwing errors - they just silently fail to rollover
+      unless @client.ilm_policy_exists?(policy_name)
+        logger.error("ILM policy creation failed - policy does not exist in Elasticsearch", 
+                     :policy_name => policy_name,
+                     :container => alias_name)
+        # Don't cache - retry on next event
+        return
+      end
+      
+      # Step 3: Create template (references the policy)
       ensure_template_exists(template_name, alias_name, policy_name)
+      
+      # Step 4: Create rollover alias and first index
       ensure_rollover_alias_exists(alias_name)
       
       # Mark as created (cache for performance)
       @dynamic_templates_created.put(alias_name, true)
       
-      logger.info("Initialized dynamic ILM resources for container", 
+      logger.info("Initialized and verified dynamic ILM resources for container", 
                   :container => alias_name,
                   :template_name => template_name, 
                   :index_pattern => "#{alias_name}-*",
                   :ilm_policy => policy_name,
-                  :write_alias => alias_name)
+                  :write_alias => alias_name,
+                  :verified => true)
     rescue => e
       # Don't cache on failure - will retry on next event
       logger.error("Failed to initialize dynamic ILM resources", 
@@ -44,34 +61,60 @@ module LogStash; module Outputs; class ElasticSearch
                    :error => e.message,
                    :backtrace => e.backtrace.first(5))
     end
-    
-    # Handle indexing errors that might indicate missing resources
+      # Handle indexing errors that might indicate missing resources
     # Call this when you get indexing errors to auto-recover
     def handle_dynamic_ilm_error(index_name, error)
       return unless ilm_in_use?
       return unless @ilm_rollover_alias&.include?('%{')
       
       alias_name = index_name
-      error_message = error.message.to_s.downcase
+      error_message = error.message.to_s
+      error_type = error.class.name
       
-      # Check if error indicates missing ILM policy, template, or alias
-      missing_policy = error_message.include?('policy') || error_message.include?('ilm')
-      missing_template = error_message.include?('template')
-      missing_alias = error_message.include?('alias') || error_message.include?('index_not_found')
+      # Detect specific Elasticsearch error conditions based on actual error responses
       
-      if missing_policy || missing_template || missing_alias
-        logger.warn("Detected missing ILM resource, attempting recovery", 
+      # Missing rollover alias errors:
+      # - IllegalArgumentException: "index.lifecycle.rollover_alias [alias_name] does not point to index [index_name]"
+      # - AliasesNotFoundException: "Aliases not found"
+      missing_alias = error_type.include?('AliasesNotFoundException') ||
+                      error_message.include?('rollover_alias') && error_message.include?('does not point to index') ||
+                      error_message.include?('Aliases not found') ||
+                      error_message.include?('alias') && error_message.include?('not found')
+      
+      # Missing ILM policy errors:
+      # - Policy referenced but doesn't exist (silent failure - no immediate error)
+      # - Need to check if rollover is not happening
+      missing_policy = error_message.include?('policy') && error_message.include?('does not exist') ||
+                       error_message.include?('lifecycle policy') && error_message.include?('not found')
+      
+      # Missing index template errors:
+      # - TemplateNotFoundException: "Template not found"
+      missing_template = error_type.include?('TemplateNotFoundException') ||
+                         error_message.include?('Template not found') ||
+                         error_message.include?('index_template') && error_message.include?('not found')
+      
+      # General index creation failures
+      index_creation_failed = error_type.include?('IndexNotFoundException') ||
+                              error_message.include?('no such index') ||
+                              error_message.include?('index_not_found_exception')
+      
+      if missing_policy || missing_template || missing_alias || index_creation_failed
+        logger.warn("Detected missing or invalid ILM resource, attempting recovery", 
                     :container => alias_name,
-                    :error_type => error.class.name)
+                    :error_type => error_type,
+                    :error_message => error_message,
+                    :missing_alias => missing_alias,
+                    :missing_policy => missing_policy,
+                    :missing_template => missing_template)
         
         # Clear cache to force recreation
         @dynamic_templates_created.delete(alias_name)
         @dynamic_policies_created.delete(alias_name)
         
-        # Recreate resources
+        # Recreate resources with verification
         maybe_create_dynamic_template(alias_name)
       end
-    end    
+    end
     private
     
     # Ensure ILM policy exists (idempotent - only creates if missing)
