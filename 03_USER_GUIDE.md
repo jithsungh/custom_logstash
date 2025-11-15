@@ -55,7 +55,7 @@ Before using dynamic ILM, ensure:
    ```json
    {
      "message": "Application started",
-     "container_name": "payment-service",
+     "container_name": "betplacement",
      "timestamp": "2025-11-15T10:30:00Z"
    }
    ```
@@ -119,23 +119,23 @@ After the first event:
 
 ### Lifecycle Example
 
-For container "payment-service":
+For container "betplacement":
 
 ```
 Day 1 (Nov 15):
 ├─ First event arrives
-├─ Creates payment-service-ilm-policy
-├─ Creates logstash-payment-service template
-├─ Creates payment-service-2025.11.15-000001 index
-└─ Write alias: payment-service → payment-service-2025.11.15-000001
+├─ Creates betplacement-ilm-policy
+├─ Creates logstash-betplacement template
+├─ Creates betplacement-2025.11.15-000001 index
+└─ Write alias: betplacement → betplacement-2025.11.15-000001
 
 Day 2 (Nov 16, 00:00):
 ├─ Max age reached (1 day)
-├─ ILM automatically creates payment-service-2025.11.16-000002
-└─ Write alias: payment-service → payment-service-2025.11.16-000002
+├─ ILM automatically creates betplacement-2025.11.16-000002
+└─ Write alias: betplacement → betplacement-2025.11.16-000002
 
 Day 9 (Nov 23):
-├─ payment-service-2025.11.15-000001 reaches delete age (7 days)
+├─ betplacement-2025.11.15-000001 reaches delete age (7 days)
 └─ ILM automatically deletes old index
 ```
 

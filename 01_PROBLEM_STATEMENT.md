@@ -80,9 +80,9 @@ Logstash's ILM implementation creates resources at **startup**, not per-event:
 **Scenario:**
 
 ```
-nginx container logs:      {"response_time": 0.123}    # float
-payment-api logs:          {"response_time": "123ms"}  # string
-auth-service logs:         {"response_time": 123}      # integer
+uibackend container logs:           {"response_time": 0.123}    # float
+e3fbrandmapperbetgenius logs:       {"response_time": "123ms"}  # string
+betplacement logs:                  {"response_time": 123}      # integer
 ```
 
 **Result:** All three cannot coexist in the same index template.
@@ -100,6 +100,8 @@ auth-service logs:         {"response_time": 123}      # integer
 - **Trigger:** When first event from a container arrives
 - **Behavior:** Policy created once, never overwritten
 
+**Example:** First event from `uibackend` creates `uibackend-ilm-policy`
+
 #### FR2: Dynamic Template Creation
 
 - **Requirement:** Automatically create one index template per container
@@ -107,12 +109,16 @@ auth-service logs:         {"response_time": 123}      # integer
 - **Pattern:** Matches `<container-name>-*` indices
 - **Behavior:** Template created once, never overwritten
 
+**Example:** First event from `betplacement` creates `logstash-betplacement` template
+
 #### FR3: Dynamic Index Creation
 
 - **Requirement:** Automatically create rollover indices per container
 - **Naming:** `<container-name>-YYYY.MM.DD-000001`
 - **Alias:** `<container-name>` (write alias)
 - **Behavior:** Managed by ILM policy
+
+**Example:** First event from `e3fbrandmapperbetgenius` creates `e3fbrandmapperbetgenius-2025.11.15-000001`
 
 #### FR4: Configurable Policy Defaults
 
@@ -180,10 +186,10 @@ ilm_delete_enabled => true
 
 **Services:**
 
-- `payment-api` → 90 days retention (compliance)
-- `user-auth` → 30 days retention (security)
+- `betplacement` → 90 days retention (compliance)
+- `uibackend` → 30 days retention (security)
+- `e3fbrandmapperbetgenius` → 7 days retention (standard)
 - `test-service` → 1 day retention (cleanup)
-- `nginx-ingress` → 7 days retention (standard)
 
 **Solution:**
 
@@ -218,7 +224,7 @@ ilm_delete_enabled => true
 
 **Solution:**
 
-- `container_name` includes environment: `api-prod`, `api-staging`, `api-dev`
+- `container_name` includes environment: `betplacement-prod`, `betplacement-staging`, `betplacement-dev`
 - Each gets appropriate ILM policy
 
 ---
@@ -301,7 +307,7 @@ Event Flow:
        ▼
 ┌─────────────────────────────┐
 │  Check Cache                │
-│  "uibackend" created?           │
+│  "uibackend" created?       │
 └──────┬──────────────────────┘
        │
        ├─ YES → Index Event (fast path)
@@ -367,9 +373,9 @@ Upon approval, the implementation will:
 
 ## Document Control
 
-| Version | Date       | Author      | Changes                       |
-| ------- | ---------- | ----------- | ----------------------------- |
-| 1.0     | 2025-11-15 | SRE Team | Initial requirements document |
+| Version | Date       | Author           | Changes                       |
+| ------- | ---------- | ---------------- | ----------------------------- |
+| 1.0     | 2025-11-15 | Engineering Team | Initial requirements document |
 
 ---
 

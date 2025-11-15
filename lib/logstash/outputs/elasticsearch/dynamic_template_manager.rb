@@ -5,8 +5,9 @@ module LogStash; module Outputs; class ElasticSearch
     def initialize_dynamic_template_cache
       @dynamic_templates_created ||= java.util.concurrent.ConcurrentHashMap.new
       @dynamic_policies_created ||= java.util.concurrent.ConcurrentHashMap.new
-    end
-      # Create a template and ILM policy for a specific container/index pattern if ILM is enabled with dynamic alias
+    end    # Create a template and ILM policy for a specific container/index pattern if ILM is enabled with dynamic alias
+    # Uses lazy creation: only creates resources on first event, then caches
+    # Automatically recreates if Elasticsearch returns errors (resilient to manual deletions)
     def maybe_create_dynamic_template(index_name)
       return unless ilm_in_use?
       return unless @ilm_rollover_alias&.include?('%{')
@@ -15,76 +16,78 @@ module LogStash; module Outputs; class ElasticSearch
       # because @index is set to @ilm_rollover_alias in setup_ilm
       alias_name = index_name
       
-      # Check if we've already created resources for this alias
+      # Check cache - if already created, skip (resources exist in Elasticsearch)
       return if @dynamic_templates_created.get(alias_name)
       
-      # Create ILM policy first (if it doesn't exist)
+      # Build resource names
       policy_name = "#{alias_name}-ilm-policy"
-      maybe_create_dynamic_ilm_policy(policy_name, alias_name)
-      
-      # Create the template
       template_name = "logstash-#{alias_name}"
-      create_template_for_index(template_name, alias_name, policy_name)
       
-      # Create the first rollover index with write alias
-      create_rollover_index(alias_name)
+      # Create resources (idempotent - checks existence internally)
+      ensure_ilm_policy_exists(policy_name, alias_name)
+      ensure_template_exists(template_name, alias_name, policy_name)
+      ensure_rollover_alias_exists(alias_name)
       
-      # Mark as created
+      # Mark as created (cache for performance)
       @dynamic_templates_created.put(alias_name, true)
-      logger.info("Created dynamic ILM resources for container", 
+      
+      logger.info("Initialized dynamic ILM resources for container", 
                   :container => alias_name,
                   :template_name => template_name, 
                   :index_pattern => "#{alias_name}-*",
                   :ilm_policy => policy_name,
                   :write_alias => alias_name)
     rescue => e
-      logger.error("Failed to create dynamic template/policy", 
-                   :alias_name => alias_name, 
+      # Don't cache on failure - will retry on next event
+      logger.error("Failed to initialize dynamic ILM resources", 
+                   :container => alias_name, 
                    :error => e.message,
                    :backtrace => e.backtrace.first(5))
     end
     
+    # Handle indexing errors that might indicate missing resources
+    # Call this when you get indexing errors to auto-recover
+    def handle_dynamic_ilm_error(index_name, error)
+      return unless ilm_in_use?
+      return unless @ilm_rollover_alias&.include?('%{')
+      
+      alias_name = index_name
+      error_message = error.message.to_s.downcase
+      
+      # Check if error indicates missing ILM policy, template, or alias
+      missing_policy = error_message.include?('policy') || error_message.include?('ilm')
+      missing_template = error_message.include?('template')
+      missing_alias = error_message.include?('alias') || error_message.include?('index_not_found')
+      
+      if missing_policy || missing_template || missing_alias
+        logger.warn("Detected missing ILM resource, attempting recovery", 
+                    :container => alias_name,
+                    :error_type => error.class.name)
+        
+        # Clear cache to force recreation
+        @dynamic_templates_created.delete(alias_name)
+        @dynamic_policies_created.delete(alias_name)
+        
+        # Recreate resources
+        maybe_create_dynamic_template(alias_name)
+      end
+    end    
     private
     
-    # Create the first rollover index with write alias
-    def create_rollover_index(alias_name)
-      # Create index name with rollover pattern: <alias>-<pattern>
-      # Default pattern is "{now/d}-000001", we'll use a simpler "000001"
-      index_target = "<#{alias_name}-{now/d}-000001>"
-      
-      rollover_payload = {
-        'aliases' => {
-          alias_name => {
-            'is_write_index' => true
-          }
-        }
-      }
-      
-      # Only create if the alias doesn't already exist
-      unless @client.rollover_alias_exists?(alias_name)
-        @client.rollover_alias_put(index_target, rollover_payload)
-        logger.debug("Created rollover index and alias", 
-                     :index_target => index_target,
-                     :alias => alias_name)
-      end
-    end
-    
-    # Create an ILM policy dynamically for a container
-    def maybe_create_dynamic_ilm_policy(policy_name, base_name)
-      # Check if already created in this session
+    # Ensure ILM policy exists (idempotent - only creates if missing)
+    def ensure_ilm_policy_exists(policy_name, base_name)
+      # Check cache first (fast path)
       return if @dynamic_policies_created.get(base_name)
       
-      # Check if policy already exists in Elasticsearch
+      # Check if policy exists in Elasticsearch
       if @client.ilm_policy_exists?(policy_name)
-        logger.debug("ILM policy already exists, skipping creation", :policy_name => policy_name)
         @dynamic_policies_created.put(base_name, true)
+        logger.debug("ILM policy already exists", :policy_name => policy_name)
         return
       end
       
-      # Build the policy payload
+      # Policy doesn't exist - create it
       policy_payload = build_dynamic_ilm_policy
-      
-      # Create the policy
       @client.ilm_policy_put(policy_name, policy_payload)
       @dynamic_policies_created.put(base_name, true)
       
@@ -95,7 +98,37 @@ module LogStash; module Outputs; class ElasticSearch
                   :delete_min_age => @ilm_delete_min_age)
     end
     
-    # Build ILM policy payload based on configuration
+    # Ensure index template exists (idempotent)
+    def ensure_template_exists(template_name, base_name, policy_name)
+      index_pattern = "#{base_name}-*"
+      template = build_dynamic_template(index_pattern, policy_name)
+      endpoint = TemplateManager.send(:template_endpoint, self)
+      
+      # template_install is already idempotent (won't overwrite existing templates)
+      @client.template_install(endpoint, template_name, template, false)
+      logger.debug("Template ensured", :template_name => template_name)
+    end
+    
+    # Ensure rollover alias exists (idempotent)
+    def ensure_rollover_alias_exists(alias_name)
+      # Check if alias exists
+      return if @client.rollover_alias_exists?(alias_name)
+      
+      # Create the first rollover index with write alias
+      index_target = "<#{alias_name}-{now/d}-000001>"
+      rollover_payload = {
+        'aliases' => {
+          alias_name => {
+            'is_write_index' => true
+          }
+        }
+      }
+      
+      @client.rollover_alias_put(index_target, rollover_payload)
+      logger.info("Created rollover alias and index", 
+                  :alias => alias_name,
+                  :index_pattern => index_target)
+    end    # Build ILM policy payload based on configuration
     def build_dynamic_ilm_policy
       policy = {
         "policy" => {
@@ -136,21 +169,7 @@ module LogStash; module Outputs; class ElasticSearch
         }
         policy["policy"]["phases"]["delete"] = delete_phase
       end
-      
-      policy
-    end
-    
-    # Create a template for a specific index pattern
-    def create_template_for_index(template_name, base_name, policy_name)
-      index_pattern = "#{base_name}-*"
-      
-      template = build_dynamic_template(index_pattern, policy_name)
-      
-      # Use the appropriate endpoint based on ES version
-      endpoint = TemplateManager.send(:template_endpoint, self)
-      
-      # Install the template
-      @client.template_install(endpoint, template_name, template, false)
+        policy
     end
     
     # Build a template for dynamic ILM indices

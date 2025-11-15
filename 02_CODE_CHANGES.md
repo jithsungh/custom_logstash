@@ -13,8 +13,8 @@ This document details all code modifications made to implement dynamic ILM (Inde
 | Core Plugin      | Modified | 1             | 25          | 10             | Medium     |
 | ILM Module       | Modified | 1             | 5           | 3              | Low        |
 | Template Manager | Modified | 1             | 15          | 8              | Medium     |
-| Dynamic Manager  | New      | 1             | 170         | 0              | High       |
-| **Total**        | -        | **4**         | **215**     | **21**         | **Medium** |
+| Dynamic Manager  | New      | 1             | 200         | 0              | High       |
+| **Total**        | -        | **4**         | **245**     | **21**         | **Medium** |
 
 ---
 
@@ -49,45 +49,156 @@ def maybe_create_dynamic_template(index_name)
   return unless @ilm_rollover_alias&.include?('%{')
 
   alias_name = index_name
+
+  # Cache-first: skip if already created
   return if @dynamic_templates_created.get(alias_name)
 
-  # Create policy, template, and rollover index
+  # Build resource names
   policy_name = "#{alias_name}-ilm-policy"
-  maybe_create_dynamic_ilm_policy(policy_name, alias_name)
-
   template_name = "logstash-#{alias_name}"
-  create_template_for_index(template_name, alias_name, policy_name)
 
-  create_rollover_index(alias_name)
+  # Create resources (idempotent operations)
+  ensure_ilm_policy_exists(policy_name, alias_name)
+  ensure_template_exists(template_name, alias_name, policy_name)
+  ensure_rollover_alias_exists(alias_name)
 
+  # Mark as created in cache
   @dynamic_templates_created.put(alias_name, true)
+
+  logger.info("Initialized dynamic ILM resources for container",
+              :container => alias_name,
+              :template_name => template_name,
+              :index_pattern => "#{alias_name}-*",
+              :ilm_policy => policy_name,
+              :write_alias => alias_name)
+rescue => e
+  # Don't cache on failure - retry on next event
+  logger.error("Failed to initialize dynamic ILM resources",
+               :container => alias_name,
+               :error => e.message,
+               :backtrace => e.backtrace.first(5))
 end
 ```
 
-- **Purpose:** Main orchestration method for resource creation
-- **Impact:** Called once per unique container name
-- **Performance:** Cached results prevent repeated execution
+- **Purpose:** Main orchestration method for dynamic resource creation
+- **Impact:** Called once per unique container (e.g., `uibackend`, `betplacement`)
+- **Performance:** Cache-first approach - zero overhead after first event
+- **Resilience:** Errors don't crash pipeline; resources recreated on next event
 
-#### `maybe_create_dynamic_ilm_policy(policy_name, base_name)`
+#### `handle_dynamic_ilm_error(index_name, error)`
 
 ```ruby
-def maybe_create_dynamic_ilm_policy(policy_name, base_name)
+def handle_dynamic_ilm_error(index_name, error)
+  return unless ilm_in_use?
+  return unless @ilm_rollover_alias&.include?('%{')
+
+  alias_name = index_name
+  error_message = error.message.to_s.downcase
+
+  # Detect if error indicates missing ILM resources
+  missing_policy = error_message.include?('policy') || error_message.include?('ilm')
+  missing_template = error_message.include?('template')
+  missing_alias = error_message.include?('alias') || error_message.include?('index_not_found')
+
+  if missing_policy || missing_template || missing_alias
+    logger.warn("Detected missing ILM resource, attempting recovery",
+                :container => alias_name,
+                :error_type => error.class.name)
+
+    # Clear cache to force recreation
+    @dynamic_templates_created.delete(alias_name)
+    @dynamic_policies_created.delete(alias_name)
+
+    # Recreate resources
+    maybe_create_dynamic_template(alias_name)
+  end
+end
+```
+
+- **Purpose:** Auto-recovery mechanism for manually deleted resources
+- **Impact:** Detects and recovers from resource deletion in Kibana
+- **Trigger:** Called when indexing errors suggest missing ILM components
+- **Benefit:** Self-healing without manual intervention
+
+#### `ensure_ilm_policy_exists(policy_name, base_name)`
+
+```ruby
+def ensure_ilm_policy_exists(policy_name, base_name)
+  # Check cache first (fast path)
   return if @dynamic_policies_created.get(base_name)
 
+  # Check if policy exists in Elasticsearch
   if @client.ilm_policy_exists?(policy_name)
     @dynamic_policies_created.put(base_name, true)
+    logger.debug("ILM policy already exists", :policy_name => policy_name)
     return
   end
 
+  # Policy doesn't exist - create it
   policy_payload = build_dynamic_ilm_policy
   @client.ilm_policy_put(policy_name, policy_payload)
   @dynamic_policies_created.put(base_name, true)
+
+  logger.info("Created dynamic ILM policy",
+              :policy_name => policy_name,
+              :container => base_name,
+              :rollover_max_age => @ilm_rollover_max_age,
+              :delete_min_age => @ilm_delete_min_age)
 end
 ```
 
-- **Purpose:** Create ILM policy if it doesn't exist
-- **Impact:** One-time creation, preserves manual edits
+- **Purpose:** Idempotent ILM policy creation
+- **Impact:** Creates policy only if missing; preserves manual edits in Kibana
 - **API Calls:** `ilm_policy_exists?()`, `ilm_policy_put()`
+- **Example:** Creates `uibackend-ilm-policy` for first `uibackend` event
+
+#### `ensure_template_exists(template_name, base_name, policy_name)`
+
+```ruby
+def ensure_template_exists(template_name, base_name, policy_name)
+  index_pattern = "#{base_name}-*"
+  template = build_dynamic_template(index_pattern, policy_name)
+  endpoint = TemplateManager.send(:template_endpoint, self)
+
+  # template_install is already idempotent
+  @client.template_install(endpoint, template_name, template, false)
+  logger.debug("Template ensured", :template_name => template_name)
+end
+```
+
+- **Purpose:** Idempotent template installation
+- **Impact:** Creates template only if missing
+- **API Calls:** `template_install()`
+- **Example:** Creates `logstash-betplacement` template
+
+#### `ensure_rollover_alias_exists(alias_name)`
+
+```ruby
+def ensure_rollover_alias_exists(alias_name)
+  # Check if alias exists
+  return if @client.rollover_alias_exists?(alias_name)
+
+  # Create the first rollover index with write alias
+  index_target = "<#{alias_name}-{now/d}-000001>"
+  rollover_payload = {
+    'aliases' => {
+      alias_name => {
+        'is_write_index' => true
+      }
+    }
+  }
+
+  @client.rollover_alias_put(index_target, rollover_payload)
+  logger.info("Created rollover alias and index",
+              :alias => alias_name,
+              :index_pattern => index_target)
+end
+```
+
+- **Purpose:** Idempotent rollover index creation
+- **Impact:** Creates first index with write alias if missing
+- **API Calls:** `rollover_alias_exists?()`, `rollover_alias_put()`
+- **Example:** Creates `e3fbrandmapperbetgenius-2025.11.15-000001` with alias `e3fbrandmapperbetgenius`
 
 #### `build_dynamic_ilm_policy()`
 
@@ -141,10 +252,17 @@ end
 - **Purpose:** Create first rollover index with write alias
 - **Impact:** Enables ILM-managed rollover
 - **API Calls:** `rollover_alias_exists?()`, `rollover_alias_put()`
+- **Example:** Creates `e3fbrandmapperbetgenius-2025.11.15-000001` with alias `e3fbrandmapperbetgenius`
 
-**Lines Added:** 170  
+**Lines Added:** 200  
 **Complexity:** Medium  
 **Test Coverage:** Integration tests recommended
+**Resilience Features:**
+
+- Idempotent resource creation (safe to call multiple times)
+- Error recovery mechanism (`handle_dynamic_ilm_error`)
+- Cache invalidation on resource deletion
+- Graceful failure handling (events still indexed on errors)
 
 ---
 
@@ -372,9 +490,9 @@ All methods below **already exist** in `http_client.rb`:
 #### Scenario 1: Multiple Events from Same Container
 
 ```
-Thread 1: Event from "nginx" → Check cache → HIT → Skip creation
-Thread 2: Event from "nginx" → Check cache → HIT → Skip creation
-Thread 3: Event from "nginx" → Check cache → HIT → Skip creation
+Thread 1: Event from "betplacement" → Check cache → HIT → Skip creation
+Thread 2: Event from "betplacement" → Check cache → HIT → Skip creation
+Thread 3: Event from "betplacement" → Check cache → HIT → Skip creation
 ```
 
 **Status:** ✅ Safe - ConcurrentHashMap provides atomic reads
@@ -382,8 +500,8 @@ Thread 3: Event from "nginx" → Check cache → HIT → Skip creation
 #### Scenario 2: First Event from Same Container (Race Condition)
 
 ```
-Thread 1: Event from "nginx" → Check cache → MISS → Start creation
-Thread 2: Event from "nginx" → Check cache → MISS → Start creation
+Thread 1: Event from "uibackend" → Check cache → MISS → Start creation
+Thread 2: Event from "uibackend" → Check cache → MISS → Start creation
 ```
 
 **Mitigation:**
@@ -478,14 +596,14 @@ describe DynamicTemplateManager do
   end
 
   it "creates policy for new container" do
-    expect(client).to receive(:ilm_policy_put).with("nginx-ilm-policy", anything)
-    plugin.maybe_create_dynamic_template("nginx")
+    expect(client).to receive(:ilm_policy_put).with("uibackend-ilm-policy", anything)
+    plugin.maybe_create_dynamic_template("uibackend")
   end
 
   it "skips creation for cached container" do
-    plugin.maybe_create_dynamic_template("nginx")
+    plugin.maybe_create_dynamic_template("betplacement")
     expect(client).not_to receive(:ilm_policy_put)
-    plugin.maybe_create_dynamic_template("nginx")
+    plugin.maybe_create_dynamic_template("betplacement")
   end
 end
 ```
@@ -628,9 +746,10 @@ ilm_policy => "standard-policy"
 
 ## Document Control
 
-| Version | Date       | Author      | Changes               |
-| ------- | ---------- | ----------- | --------------------- |
-| 1.0     | 2025-11-15 | DevOps Team | Initial code analysis |
+| Version | Date       | Author           | Changes                                   |
+| ------- | ---------- | ---------------- | ----------------------------------------- |
+| 1.0     | 2025-11-15 | Engineering Team | Initial code analysis                     |
+| 1.1     | 2025-11-15 | Engineering Team | Updated with final implementation details |
 
 ---
 
