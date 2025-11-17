@@ -1,4 +1,5 @@
-module LogStash; module Outputs; class ElasticSearch  class TemplateManager
+module LogStash; module Outputs; class ElasticSearch
+  class TemplateManager
     LEGACY_TEMPLATE_ENDPOINT = '_template'.freeze
     INDEX_TEMPLATE_ENDPOINT = '_index_template'.freeze
 
@@ -14,9 +15,7 @@ module LogStash; module Outputs; class ElasticSearch  class TemplateManager
                            "The legacy template API is slated for removal in Elasticsearch 9.")
       elsif plugin.template_api == 'legacy' && plugin.serverless?
         raise LogStash::ConfigurationError, "Invalid template configuration `template_api => legacy`. Serverless Elasticsearch does not support legacy template API."
-      end
-
-      # Skip static template creation if using dynamic ILM rollover alias
+      end      # Skip static template creation if using dynamic ILM rollover alias
       # Templates will be created per-container on first event
       if plugin.ilm_in_use? && plugin.ilm_rollover_alias&.include?('%{')
         plugin.logger.info("Skipping static template installation for dynamic ILM rollover alias. " +
@@ -24,10 +23,11 @@ module LogStash; module Outputs; class ElasticSearch  class TemplateManager
                           :ilm_rollover_alias => plugin.ilm_rollover_alias)
         return
       end
-
+      
       if plugin.template
         plugin.logger.info("Using mapping template from", :path => plugin.template)
-        template = read_template_file(plugin.template)      else
+        template = read_template_file(plugin.template)
+      else
         plugin.logger.info("Using a default mapping template", :es_version => plugin.maximum_seen_major_version,
                                                                :ecs_compatibility => plugin.ecs_compatibility)
         template = load_default_template(plugin.maximum_seen_major_version, plugin.ecs_compatibility)
@@ -143,12 +143,11 @@ module LogStash; module Outputs; class ElasticSearch  class TemplateManager
           true
         when 'legacy'
           false
-        else
-          plugin.logger.warn("Invalid template_api value #{plugin.template_api}")
+        else          plugin.logger.warn("Invalid template_api value #{plugin.template_api}")
           true
         end
       end
     end
 
   end
-end end end
+end; end; end

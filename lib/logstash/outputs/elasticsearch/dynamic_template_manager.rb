@@ -5,7 +5,9 @@ module LogStash; module Outputs; class ElasticSearch
     def initialize_dynamic_template_cache
       @dynamic_templates_created ||= java.util.concurrent.ConcurrentHashMap.new
       @dynamic_policies_created ||= java.util.concurrent.ConcurrentHashMap.new
-    end    # Create a template and ILM policy for a specific container/index pattern if ILM is enabled with dynamic alias
+    end
+    
+    # Create a template and ILM policy for a specific container/index pattern if ILM is enabled with dynamic alias
     # Uses lazy creation: only creates resources on first event, then caches
     # Automatically recreates if Elasticsearch returns errors (resilient to manual deletions)
     def maybe_create_dynamic_template(index_name)
@@ -151,14 +153,14 @@ module LogStash; module Outputs; class ElasticSearch
       @client.template_install(endpoint, template_name, template, false)
       logger.debug("Template ensured", :template_name => template_name)
     end
-    
-    # Ensure rollover alias exists (idempotent)
+      # Ensure rollover alias exists (idempotent)
     def ensure_rollover_alias_exists(alias_name)
       # Check if alias exists
       return if @client.rollover_alias_exists?(alias_name)
       
       # Create the first rollover index with write alias
       index_target = "<#{alias_name}-{now/d}-000001>"
+      
       rollover_payload = {
         'aliases' => {
           alias_name => {
@@ -168,10 +170,13 @@ module LogStash; module Outputs; class ElasticSearch
       }
       
       @client.rollover_alias_put(index_target, rollover_payload)
+      
       logger.info("Created rollover alias and index", 
                   :alias => alias_name,
                   :index_pattern => index_target)
-    end    # Build ILM policy payload based on configuration
+    end
+    
+    # Build ILM policy payload based on configuration
     def build_dynamic_ilm_policy
       policy = {
         "policy" => {
