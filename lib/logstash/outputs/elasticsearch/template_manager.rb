@@ -52,7 +52,8 @@ module LogStash; module Outputs; class ElasticSearch  class TemplateManager
 
     def self.install(client, template_endpoint, template_name, template, template_overwrite)
       client.template_install(template_endpoint, template_name, template, template_overwrite)
-    end    def self.add_ilm_settings_to_template(plugin, template)
+    end    
+    def self.add_ilm_settings_to_template(plugin, template)
       # Check if using dynamic rollover alias (contains sprintf placeholders)
       if plugin.ilm_rollover_alias&.include?('%{')
         # For dynamic aliases, skip template installation at startup
