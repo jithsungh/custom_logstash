@@ -1,9 +1,9 @@
-module LogStash; module Outputs; class ElasticSearch
-  class TemplateManager
+module LogStash; module Outputs; class ElasticSearch  class TemplateManager
     LEGACY_TEMPLATE_ENDPOINT = '_template'.freeze
     INDEX_TEMPLATE_ENDPOINT = '_index_template'.freeze
 
-    # To be mixed into the elasticsearch plugin base    def self.install_template(plugin)
+    # To be mixed into the elasticsearch plugin base
+    def self.install_template(plugin)
       return unless plugin.manage_template
 
       if plugin.maximum_seen_major_version < 8 && plugin.template_api == 'auto'
@@ -27,12 +27,13 @@ module LogStash; module Outputs; class ElasticSearch
 
       if plugin.template
         plugin.logger.info("Using mapping template from", :path => plugin.template)
-        template = read_template_file(plugin.template)
-      else
+        template = read_template_file(plugin.template)      else
         plugin.logger.info("Using a default mapping template", :es_version => plugin.maximum_seen_major_version,
                                                                :ecs_compatibility => plugin.ecs_compatibility)
         template = load_default_template(plugin.maximum_seen_major_version, plugin.ecs_compatibility)
-      end      if plugin.ilm_in_use?
+      end
+      
+      if plugin.ilm_in_use?
         result = add_ilm_settings_to_template(plugin, template)
         return if result == :skip_template  # Skip template installation for dynamic ILM
       end
