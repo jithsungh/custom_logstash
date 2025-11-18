@@ -491,8 +491,9 @@ module LogStash; module Outputs; class ElasticSearch;
       # Other errors should be raised
       logger.error("=== UNEXPECTED ERROR CHECKING ALIAS ===", :alias => name, :response_code => e.response_code, :error => e.message)
       raise e
-    end      # Create a new rollover alias with initial index
-    # This uses a bootstrap index creation approach that works around date math URL encoding issues    def rollover_alias_put(index_pattern, alias_definition)
+    end    # Create a new rollover alias with initial index
+    # This uses a bootstrap index creation approach that works around date math URL encoding issues
+    def rollover_alias_put(index_pattern, alias_definition)
       logger.warn("=== ROLLOVER_ALIAS_PUT CALLED ===", :index_pattern => index_pattern)
       
       # Extract the alias name from the definition
@@ -526,11 +527,12 @@ module LogStash; module Outputs; class ElasticSearch;
       logger.warn("=== CALLING @pool.put ===", :index => first_index_name)
       # Create the index with the alias
       @pool.put(first_index_name, nil, index_payload_json)
-      logger.warn("=== @pool.put RETURNED SUCCESSFULLY ===", :index => first_index_name)      
+      logger.warn("=== @pool.put RETURNED SUCCESSFULLY ===", :index => first_index_name)
+      
       logger.warn("=== ROLLOVER INDEX CREATED ===", 
                   :index => first_index_name,
-                  :alias => alias_name)    
-      rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+                  :alias => alias_name)
+    rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
       if e.response_code == 400
         response_body = e.response_body.to_s
         
