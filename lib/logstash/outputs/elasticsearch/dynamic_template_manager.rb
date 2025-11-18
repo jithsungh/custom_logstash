@@ -428,23 +428,52 @@ module LogStash; module Outputs; class ElasticSearch  module DynamicTemplateMana
           }
         }
       end
-    end
-
-    # Check if a simple index (not an alias) exists with the given name
+    end    # Check if a simple index (not an alias) exists with the given name
     def simple_index_exists?(index_name)
       begin
-        response = @client.pool.get("#{index_name}")
-        # If we get a response, check if it's an index (not an alias)
-        # An index response will have settings, mappings, etc.
-        return response && response[index_name] && response[index_name]['settings']
+        # Use GET /index_name to check if an index exists
+        response = @client.pool.get(index_name)
+        parsed = LogStash::Json.load(response.body)
+        
+        logger.warn("=== SIMPLE INDEX CHECK RESPONSE ===", :index => index_name, :response => parsed)
+        
+        # If we get a 200 response with index details, it's a simple index
+        # Response format: { "index_name" => { "aliases" => {...}, "mappings" => {...}, "settings" => {...} } }
+        if parsed && parsed.is_a?(Hash) && parsed[index_name]
+          # Check if it has aliases field - if empty or doesn't point to write alias, it's a simple index
+          index_data = parsed[index_name]
+          aliases = index_data['aliases'] || {}
+          
+          # It's a simple index if:
+          # 1. It exists (we got here)
+          # 2. It has no aliases, OR
+          # 3. It has aliases but none with is_write_index: true
+          
+          if aliases.empty?
+            logger.warn("=== FOUND SIMPLE INDEX (no aliases) ===", :index => index_name)
+            return true
+          else
+            # Check if any alias has is_write_index: true
+            has_write_alias = aliases.values.any? { |alias_def| alias_def['is_write_index'] == true }
+            if !has_write_alias
+              logger.warn("=== FOUND SIMPLE INDEX (no write alias) ===", :index => index_name, :aliases => aliases.keys)
+              return true
+            end
+          end
+        end
+        
+        return false
       rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
         # 404 means it doesn't exist - that's fine
-        return false if e.response_code == 404
+        if e.response_code == 404
+          logger.debug("=== INDEX DOES NOT EXIST (404) ===", :index => index_name)
+          return false
+        end
         # Other errors - log and assume it doesn't exist
-        logger.debug("Error checking if simple index exists", :index => index_name, :error => e.message)
+        logger.warn("Error checking if simple index exists", :index => index_name, :code => e.response_code, :error => e.message)
         return false
       rescue => e
-        logger.debug("Error checking if simple index exists", :index => index_name, :error => e.message)
+        logger.warn("Error checking if simple index exists", :index => index_name, :error => e.message, :backtrace => e.backtrace.first(2))
         return false
       end
     end
