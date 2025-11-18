@@ -631,8 +631,7 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
     return event_pipeline if event_pipeline && !@pipeline
     pipeline_template = @pipeline || event.get("[@metadata][target_ingest_pipeline]")&.to_s
     pipeline_template && event.sprintf(pipeline_template)
-  end  
-  def resolve_dynamic_rollover_alias(event)
+  end    def resolve_dynamic_rollover_alias(event)
     return nil unless ilm_in_use? && @ilm_rollover_alias_template
     
     # Perform sprintf substitution on the rollover alias template
@@ -648,6 +647,10 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
       # Fallback to default alias to avoid creating invalid index names
       resolved_alias = @default_ilm_rollover_alias
     end
+    
+    # IMPORTANT: Add "auto-" prefix to match the alias created by maybe_create_dynamic_template
+    # This prevents Elasticsearch auto-creation conflicts
+    resolved_alias = "auto-#{resolved_alias}"
     
     # NOTE: We don't call ensure_rollover_alias_exists here anymore
     # That's handled by maybe_create_dynamic_template in safe_interpolation_map_events
