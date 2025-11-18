@@ -159,21 +159,39 @@ module LogStash; module Outputs; class ElasticSearch  module DynamicTemplateMana
       @client.template_install(endpoint, template_name, template, false)
       
       logger.info("Template ready", :template => template_name, :priority => priority)
-    end
-      # Create first index with write alias (idempotent - only creates if missing)
+    end    # Create first index with write alias (idempotent - only creates if missing)
     def create_index_if_missing(alias_name, policy_name)
-      # Check if alias exists
-      if @client.rollover_alias_exists?(alias_name)
-        logger.debug("Index/alias already exists", :alias => alias_name)
-        return
+      # DEFENSIVE: Loop to handle auto-creation race conditions
+      max_attempts = 3
+      attempts = 0
+      
+      while attempts < max_attempts
+        attempts += 1
+        
+        # Check if alias exists
+        if @client.rollover_alias_exists?(alias_name)
+          logger.debug("Index/alias already exists", :alias => alias_name)
+          return
+        end
+        
+        # Check if a simple index exists with the same name as the alias
+        # This can happen if Elasticsearch auto-created it during a brief gap
+        if simple_index_exists?(alias_name)
+          logger.warn("Found simple index with alias name - deleting and recreating properly (attempt #{attempts}/#{max_attempts})", 
+                      :index => alias_name)
+          delete_simple_index(alias_name)
+          # After deletion, loop back to re-check before creating
+          sleep 0.1  # Brief pause to let deletion propagate
+          next
+        end
+        
+        # Neither alias nor simple index exists - safe to create
+        break
       end
       
-      # Check if a simple index exists with the same name as the alias
-      # This can happen if Elasticsearch auto-created it during a brief gap
-      if simple_index_exists?(alias_name)
-        logger.warn("Found simple index with alias name - deleting and recreating properly", 
-                    :index => alias_name)
-        delete_simple_index(alias_name)
+      if attempts >= max_attempts
+        logger.error("Failed to clean up auto-created index after #{max_attempts} attempts", :alias => alias_name)
+        raise StandardError.new("Cannot create rollover index: auto-created index keeps reappearing")
       end
       
       # Create first rollover index with date pattern
@@ -195,13 +213,19 @@ module LogStash; module Outputs; class ElasticSearch  module DynamicTemplateMana
           }
         }
       }
+        @client.rollover_alias_put(first_index_name, index_payload)
       
-      @client.rollover_alias_put(first_index_name, index_payload)
-      
-      logger.info("Created rollover index", 
-                  :index => first_index_name, 
-                  :alias => alias_name,
-                  :policy => policy_name)
+      # Verify the alias was created correctly (not as a simple index)
+      if @client.rollover_alias_exists?(alias_name)
+        logger.info("Created and verified rollover index", 
+                    :index => first_index_name, 
+                    :alias => alias_name,
+                    :policy => policy_name)
+      else
+        logger.error("Rollover index creation may have failed - alias not found after creation", 
+                     :index => first_index_name,
+                     :alias => alias_name)
+      end
     end
     # Check if child templates exist for a base name (simple version)
     def has_child_templates?(base_name)
