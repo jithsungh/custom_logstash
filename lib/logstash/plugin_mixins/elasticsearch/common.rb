@@ -292,12 +292,17 @@ module LogStash; module PluginMixins; module ElasticSearch
         elsif DOC_CONFLICT_CODE == status || @drop_error_types.include?(type)
           @document_level_metrics.increment(:non_retryable_failures)
           @logger.warn "Failed action", status: status, action: action, response: response if log_failure_type?(error)
-          next
-        elsif @dlq_codes.include?(status)
+          next        elsif @dlq_codes.include?(status)
           handle_dlq_response("Could not index event to Elasticsearch.", action, status, response)
           @document_level_metrics.increment(:dlq_routed)
           next
         else
+          # Check if this is an index-not-found error for dynamic ILM
+          # If so, clear cache so it gets recreated on next event
+          if error && type && (type.include?('index_not_found') || type.include?('no_such_index'))
+            handle_index_not_found_error(action) if respond_to?(:handle_index_not_found_error)
+          end
+          
           # only log what the user whitelisted
           @document_level_metrics.increment(:retryable_failures)
           @logger.info "Retrying failed action", status: status, action: action, error: error if log_failure_type?(error)

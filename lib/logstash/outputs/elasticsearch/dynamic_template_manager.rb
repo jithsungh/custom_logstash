@@ -47,8 +47,7 @@ module LogStash; module Outputs; class ElasticSearch  module DynamicTemplateMana
                    :error => e.message,
                    :backtrace => e.backtrace.first(3))
     end
-    
-    # Handle indexing errors - ONLY recreate if index is missing
+      # Handle indexing errors - ONLY recreate if index is missing
     # This is called by the bulk indexer when an error occurs
     def handle_dynamic_ilm_error(alias_name, error)
       return unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
@@ -73,7 +72,25 @@ module LogStash; module Outputs; class ElasticSearch  module DynamicTemplateMana
         @dynamic_templates_created.remove(alias_name)
         maybe_create_dynamic_template(alias_name)
       end
-    end    
+    end
+    
+    # Called from common.rb when bulk indexing encounters index_not_found error
+    # Extracts the index name from the action and clears the cache
+    def handle_index_not_found_error(action)
+      return unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
+      
+      # Action is [action_type, params, event_data]
+      # params contains :_index with the alias name
+      if action && action[1] && action[1][:_index]
+        alias_name = action[1][:_index]
+        
+        logger.warn("Index not found error detected, clearing cache for next retry", 
+                    :alias => alias_name)
+        
+        # Clear cache - next retry will recreate resources
+        @dynamic_templates_created.remove(alias_name)
+      end
+    end
     private
     
     # Create ILM policy (idempotent - only creates if missing)
