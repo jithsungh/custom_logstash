@@ -293,6 +293,26 @@ module LogStash; module PluginMixins; module ElasticSearch
           @document_level_metrics.increment(:non_retryable_failures)
           @logger.warn "Failed action", status: status, action: action, response: response if log_failure_type?(error)
           next        elsif @dlq_codes.include?(status)
+          # Special handling for 404 index_not_found with dynamic ILM
+          # If this is a 404 and we're using dynamic ILM, try to recreate the index
+          if status == 404 && error && type && (type.include?('index_not_found') || type.include?('IndexNotFoundException'))
+            if respond_to?(:handle_index_not_found_error)
+              @logger.warn("Index not found during bulk write - attempting to recreate", 
+                          :status => status, 
+                          :error_type => type,
+                          :action => action[0..1])
+              
+              # Clear cache and recreate index
+              handle_index_not_found_error(action)
+              
+              # Retry this action instead of sending to DLQ
+              @document_level_metrics.increment(:retryable_failures)
+              actions_to_retry << action
+              next
+            end
+          end
+          
+          # For other DLQ codes or if not dynamic ILM, route to DLQ
           handle_dlq_response("Could not index event to Elasticsearch.", action, status, response)
           @document_level_metrics.increment(:dlq_routed)
           next
