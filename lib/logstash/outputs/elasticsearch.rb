@@ -418,22 +418,31 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
   FailedEventMapping = Struct.new(:event, :message)
   
   private
-  
-  def safe_interpolation_map_events(events)
+    def safe_interpolation_map_events(events)
     successful_events = [] # list of LogStash::Outputs::ElasticSearch::EventActionTuple
     event_mapping_errors = [] # list of FailedEventMapping
+    
+    # Track which containers we've already processed in THIS batch to avoid duplicate checks
+    batch_processed_containers = Set.new
+    
     events.each do |event|
       begin
         event_action = @event_mapper.call(event)
         successful_events << event_action
         
         # Create dynamic template for this index if using dynamic ILM rollover alias
+        # Only process each unique container ONCE per batch (massive performance improvement)
         if ilm_in_use? && @ilm_rollover_alias&.include?('%{')
           # EventActionTuple structure: [action, params, event_data]
           # params contains :_index with the resolved index/alias name
           params = event_action[1]
           index_name = params[:_index] if params
-          maybe_create_dynamic_template(index_name) if index_name
+          
+          # Skip if we've already processed this container in this batch
+          if index_name && !batch_processed_containers.include?(index_name)
+            batch_processed_containers.add(index_name)
+            maybe_create_dynamic_template(index_name)
+          end
         end
       rescue EventMappingError => ie
         event_mapping_errors << FailedEventMapping.new(event, ie.message)
@@ -622,7 +631,7 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
     return event_pipeline if event_pipeline && !@pipeline
     pipeline_template = @pipeline || event.get("[@metadata][target_ingest_pipeline]")&.to_s
     pipeline_template && event.sprintf(pipeline_template)
-  end
+  end  
   def resolve_dynamic_rollover_alias(event)
     return nil unless ilm_in_use? && @ilm_rollover_alias_template
     
@@ -640,54 +649,21 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
       resolved_alias = @default_ilm_rollover_alias
     end
     
-    # Ensure the alias exists (thread-safe check and creation)
-    ensure_rollover_alias_exists(resolved_alias) if resolved_alias != @ilm_rollover_alias
+    # NOTE: We don't call ensure_rollover_alias_exists here anymore
+    # That's handled by maybe_create_dynamic_template in safe_interpolation_map_events
+    # This avoids duplicate calls for every event
     
     resolved_alias
   end
   private :resolve_dynamic_rollover_alias
-  def ensure_rollover_alias_exists(alias_name)
-    return if @created_aliases.include?(alias_name)
-    
-    @dynamic_alias_mutex.synchronize do
-      # Double-check inside the mutex
-      return if @created_aliases.include?(alias_name)
-      
-      begin
-        # Check if alias already exists
-        client.rollover_alias_exists?(alias_name)
-        @created_aliases.add(alias_name)
-      rescue Elasticsearch::Transport::Transport::Errors::NotFound, ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::NoConnectionAvailableError => e
-        # Alias doesn't exist, create it with ILM settings
-        begin
-          target_index = "<#{alias_name}-#{@ilm_pattern}>"
-          payload = {
-            'aliases' => {
-              alias_name => {
-                'is_write_index' => true
-              }
-            },
-            'settings' => {
-              'index.lifecycle.name' => @ilm_policy,
-              'index.lifecycle.rollover_alias' => alias_name
-            }
-          }
-          client.rollover_alias_put(target_index, payload)
-          @created_aliases.add(alias_name)
-          logger.info("Created ILM rollover alias with policy", 
-                      :alias => alias_name, 
-                      :target => target_index,
-                      :policy => @ilm_policy)
-        rescue => create_error
-          logger.error("Failed to create ILM rollover alias", 
-                       :alias => alias_name, 
-                       :error => create_error.message)
-          raise
-        end
-      end
-    end
-  end
-  private :ensure_rollover_alias_exists
+  private :resolve_dynamic_rollover_alias
+  
+  # OLD METHOD - REMOVED: Now using version from DynamicTemplateManager module
+  # which has proper logging and uses dynamic ILM policy names
+  # def ensure_rollover_alias_exists(alias_name)
+  #   ... old implementation ...
+  # end
+  # private :ensure_rollover_alias_exists
 
   @@plugins = Gem::Specification.find_all{|spec| spec.name =~ /logstash-output-elasticsearch-/ }
 
