@@ -4,13 +4,18 @@ module LogStash; module Outputs; class ElasticSearch  module DynamicTemplateMana
     def initialize_dynamic_template_cache
       @dynamic_templates_created ||= java.util.concurrent.ConcurrentHashMap.new
     end    # SIMPLIFIED: Create ILM resources (policy, template, index) for a container
-    # Called ONLY ONCE per container (first event), then cached
-    # Auto-recovers ONLY on index-related errors (not policy/template errors)
+    # Called ONLY ONCE per container (first event), then cached    # Auto-recovers ONLY on index-related errors (not policy/template errors)
     def maybe_create_dynamic_template(index_name)
       unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
         return
       end
-        alias_name = index_name      # FAST PATH: If already created, skip entirely (no checks, no API calls)
+      
+      # IMPORTANT: Add "auto-" prefix to prevent Elasticsearch auto-creation conflicts
+      # Without this, ES creates "uibackend-betrisks" before we can create "uibackend-betrisks-2025.11.18-000001"
+      # With this, we create "auto-uibackend-betrisks" alias pointing to "auto-uibackend-betrisks-2025.11.18-000001"
+      alias_name = "auto-#{index_name}"
+      
+      # FAST PATH: If already created, skip entirely (no checks, no API calls)
       current_value = @dynamic_templates_created.get(alias_name)
       if current_value == true
         return
