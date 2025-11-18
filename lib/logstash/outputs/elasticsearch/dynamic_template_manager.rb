@@ -1,10 +1,17 @@
-module LogStash; module Outputs; class ElasticSearch  module DynamicTemplateManager
+module LogStash
+  module Outputs
+    class ElasticSearch
+      module DynamicTemplateManager
     
-    # Thread-safe cache to track which containers have been initialized
-    def initialize_dynamic_template_cache
-      @dynamic_templates_created ||= java.util.concurrent.ConcurrentHashMap.new
-    end    # SIMPLIFIED: Create ILM resources (policy, template, index) for a container
-    # Called ONLY ONCE per container (first event), then cached    # Auto-recovers ONLY on index-related errors (not policy/template errors)    def maybe_create_dynamic_template(index_name)
+        # Thread-safe cache to track which containers have been initialized
+        def initialize_dynamic_template_cache
+          @dynamic_templates_created ||= java.util.concurrent.ConcurrentHashMap.new
+        end
+        
+        # SIMPLIFIED: Create ILM resources (policy, template, index) for a container
+        # Called ONLY ONCE per container (first event), then cached
+        # Auto-recovers ONLY on index-related errors (not policy/template errors)
+        def maybe_create_dynamic_template(index_name)
       unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
         return
       end
@@ -481,8 +488,7 @@ module LogStash; module Outputs; class ElasticSearch  module DynamicTemplateMana
         return false
       end
     end
-    
-    # Delete a simple index (used to clean up auto-created indices)
+      # Delete a simple index (used to clean up auto-created indices)
     def delete_simple_index(index_name)
       begin
         @client.pool.delete(index_name)
@@ -494,5 +500,7 @@ module LogStash; module Outputs; class ElasticSearch  module DynamicTemplateMana
         raise e
       end
     end
+      end
+    end
   end
-end; end; end
+end
