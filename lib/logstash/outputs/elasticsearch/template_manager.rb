@@ -15,7 +15,8 @@ module LogStash; module Outputs; class ElasticSearch
                            "The legacy template API is slated for removal in Elasticsearch 9.")
       elsif plugin.template_api == 'legacy' && plugin.serverless?
         raise LogStash::ConfigurationError, "Invalid template configuration `template_api => legacy`. Serverless Elasticsearch does not support legacy template API."
-      end      # Skip static template creation if using dynamic ILM rollover alias
+      end      
+      # Skip static template creation if using dynamic ILM rollover alias
       # Templates will be created per-container on first event
       if plugin.ilm_in_use? && plugin.ilm_rollover_alias&.include?('%{')
         plugin.logger.info("Skipping static template installation for dynamic ILM rollover alias. " +
@@ -52,7 +53,8 @@ module LogStash; module Outputs; class ElasticSearch
 
     def self.install(client, template_endpoint, template_name, template, template_overwrite)
       client.template_install(template_endpoint, template_name, template, template_overwrite)
-    end    
+    end
+    
     def self.add_ilm_settings_to_template(plugin, template)
       # Check if using dynamic rollover alias (contains sprintf placeholders)
       if plugin.ilm_rollover_alias&.include?('%{')
@@ -63,11 +65,12 @@ module LogStash; module Outputs; class ElasticSearch
         plugin.logger.info("Templates and ILM policies will be created dynamically per container")
         return :skip_template  # Signal to skip template installation
       end
-      
-      # For static aliases, use the specific alias pattern
+        # For static aliases, use the specific alias pattern
       # Overwrite any index patterns, and use the rollover alias. Use 'index_patterns' rather than 'template' for pattern
       # definition - remove any existing definition of 'template'
-      template.delete('template') if template.include?('template') if plugin.maximum_seen_major_version == 7
+      if plugin.maximum_seen_major_version == 7 && template.include?('template')
+        template.delete('template')
+      end
       template['index_patterns'] = "#{plugin.ilm_rollover_alias}-*"
       
       settings = resolve_template_settings(plugin, template)
@@ -129,25 +132,21 @@ module LogStash; module Outputs; class ElasticSearch
 
     def self.template_endpoint(plugin)
       index_template_api?(plugin) ? INDEX_TEMPLATE_ENDPOINT : LEGACY_TEMPLATE_ENDPOINT
-    end
-
-    def self.index_template_api?(plugin)
-      case plugin.serverless?
-      when true
+    end    def self.index_template_api?(plugin)
+      return true if plugin.serverless?
+      
+      case plugin.template_api
+      when 'auto'
+        plugin.maximum_seen_major_version >= 8
+      when 'composable'
         true
+      when 'legacy'
+        false
       else
-        case plugin.template_api
-        when 'auto'
-          plugin.maximum_seen_major_version >= 8
-        when 'composable'
-          true
-        when 'legacy'
-          false
-        else          plugin.logger.warn("Invalid template_api value #{plugin.template_api}")
-          true
-        end
+        plugin.logger.warn("Invalid template_api value #{plugin.template_api}")
+        true
       end
     end
 
   end
-end; end; end
+end

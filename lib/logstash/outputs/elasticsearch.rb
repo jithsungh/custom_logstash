@@ -662,14 +662,10 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
     
     resolved_alias
   end
-  private :resolve_dynamic_rollover_alias
+
+  # private :resolve_dynamic_rollover_alias
   private :resolve_dynamic_rollover_alias
   
-  # OLD METHOD - REMOVED: Now using version from DynamicTemplateManager module
-  # which has proper logging and uses dynamic ILM policy names
-  # def ensure_rollover_alias_exists(alias_name)
-  #   ... old implementation ...
-  # end
   # private :ensure_rollover_alias_exists
 
   @@plugins = Gem::Specification.find_all{|spec| spec.name =~ /logstash-output-elasticsearch-/ }

@@ -14,8 +14,6 @@ module LogStash; module Outputs; class ElasticSearch
       else
         maybe_create_rollover_alias
       end
-      
-      maybe_create_ilm_policy
     end
 
     def ilm_in_use?

@@ -417,6 +417,7 @@ module LogStash; module Outputs; class ElasticSearch;
 
       ::LogStash::Util::SafeURI.new(raw_url)
     end    
+
     def exists?(path, use_get=false)
       response = use_get ? @pool.get(path) : @pool.head(path)
       response.code >= 200 && response.code <= 299
@@ -424,7 +425,7 @@ module LogStash; module Outputs; class ElasticSearch;
       return false if e.response_code == 404
       raise e
     end
-    
+
     def template_exists?(template_endpoint, name)
       exists?("/#{template_endpoint}/#{name}")
     end
@@ -432,20 +433,36 @@ module LogStash; module Outputs; class ElasticSearch;
     # Get templates from Elasticsearch
     # Returns a hash of template_name => template_definition
     def get_template(template_endpoint, name_pattern = "*")
+      raise ArgumentError, "Invalid pattern" if name_pattern.nil? || name_pattern.strip.empty?
+    
       path = "/#{template_endpoint}/#{name_pattern}"
-      response = @pool.get(path)
-      LogStash::Json.load(response.body)
-    rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
-      return {} if e.response_code == 404
-      logger.warn("Failed to get templates", 
-                  :path => path,
-                  :response_code => e.response_code,
-                  :response_body => e.response_body)
-      return {}
-    rescue => e
-      logger.warn("Error getting templates", :path => path, :error => e.message)
-      return {}
+    
+      begin
+        response = @pool.get(path)
+        body = LogStash::Json.load(response.body)
+    
+        body.is_a?(Hash) ? body : {}
+      rescue LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+        if e.response_code == 404
+          {}
+        else
+          logger.warn(
+            "Failed to get templates",
+            path: path,
+            response_code: e.response_code,
+            response_body: e.response_body
+          )
+          nil
+        end
+      rescue LogStash::Json::ParserError => e
+        logger.error("Invalid JSON from ES", path: path, body: response.body)
+        nil
+      rescue => e
+        logger.error("Unexpected error getting templates", path: path, error: e)
+        nil
+      end
     end
+    
 
     def template_put(template_endpoint, name, template)
       path = "#{template_endpoint}/#{name}"
@@ -469,8 +486,10 @@ module LogStash; module Outputs; class ElasticSearch;
                    :response_body => e.response_body,
                    :template_sent => template_json)
       raise e unless e.response_code == 404
-    end# ILM methods
-      # check whether rollover alias already exists
+    end
+
+    # ILM methods
+    # check whether rollover alias already exists
     # This checks for an ALIAS, not an index with the same name
     def rollover_alias_exists?(name)
       logger.warn("=== ROLLOVER_ALIAS_EXISTS? CALLED ===", :alias => name)
@@ -491,7 +510,9 @@ module LogStash; module Outputs; class ElasticSearch;
       # Other errors should be raised
       logger.error("=== UNEXPECTED ERROR CHECKING ALIAS ===", :alias => name, :response_code => e.response_code, :error => e.message)
       raise e
-    end    # Create a new rollover alias with initial index
+    end    
+    
+    # Create a new rollover alias with initial index
     # This uses a bootstrap index creation approach that works around date math URL encoding issues
     def rollover_alias_put(index_pattern, alias_definition)
       logger.warn("=== ROLLOVER_ALIAS_PUT CALLED ===", :index_pattern => index_pattern)

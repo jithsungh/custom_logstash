@@ -292,7 +292,8 @@ module LogStash; module PluginMixins; module ElasticSearch
         elsif DOC_CONFLICT_CODE == status || @drop_error_types.include?(type)
           @document_level_metrics.increment(:non_retryable_failures)
           @logger.warn "Failed action", status: status, action: action, response: response if log_failure_type?(error)
-          next        elsif @dlq_codes.include?(status)
+          next        
+        elsif @dlq_codes.include?(status)
           # Special handling for 404 index_not_found with dynamic ILM
           # If this is a 404 and we're using dynamic ILM, try to recreate the index
           if status == 404 && error && type && (type.include?('index_not_found') || type.include?('IndexNotFoundException'))
