@@ -3,20 +3,47 @@ module LogStash; module Outputs; class ElasticSearch  module DynamicTemplateMana
     # Thread-safe cache to track which containers have been initialized
     def initialize_dynamic_template_cache
       @dynamic_templates_created ||= java.util.concurrent.ConcurrentHashMap.new
-    end
-    
-    # SIMPLIFIED: Create ILM resources (policy, template, index) for a container
+    end    # SIMPLIFIED: Create ILM resources (policy, template, index) for a container
     # Called ONLY ONCE per container (first event), then cached
     # Auto-recovers ONLY on index-related errors (not policy/template errors)
     def maybe_create_dynamic_template(index_name)
       unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
         return
       end
+        alias_name = index_name      # FAST PATH: If already created, skip entirely (no checks, no API calls)
+      current_value = @dynamic_templates_created.get(alias_name)
+      if current_value == true
+        return
+      end
+        # THREAD-SAFE: Use putIfAbsent to ensure only ONE thread creates resources
+      # putIfAbsent returns nil if key was absent (we won the race), 
+      # or the previous value if key already existed (another thread has it)
+      previous_value = @dynamic_templates_created.putIfAbsent(alias_name, "initializing")
       
-      alias_name = index_name
-      
-      # FAST PATH: If already created, skip entirely (no checks, no API calls)
-      if @dynamic_templates_created.get(alias_name)
+      if previous_value.nil?
+        # We won the race! Key was absent, we now hold the lock with "initializing"
+        logger.info("=== Lock acquired, proceeding with initialization ===", :container => alias_name)
+        # Continue to resource creation below
+      else
+        # Another thread already grabbed the lock (previous_value is "initializing" or true)
+        logger.debug("=== Another thread holds lock, waiting ===", 
+                     :container => alias_name, 
+                     :lock_value => previous_value)
+        
+        # If it's already fully created, return immediately
+        return if previous_value == true
+        
+        # Otherwise wait for initialization to complete (another thread is working on it)
+        50.times do
+          sleep 0.1
+          current = @dynamic_templates_created.get(alias_name)
+          if current == true
+            logger.debug("=== Initialization complete by other thread ===", :container => alias_name)
+            return
+          end
+        end
+        
+        logger.warn("=== Timeout waiting for initialization, skipping ===", :container => alias_name)
         return
       end
       
@@ -31,17 +58,17 @@ module LogStash; module Outputs; class ElasticSearch  module DynamicTemplateMana
       create_policy_if_missing(policy_name)
       create_template_if_missing(template_name, alias_name, policy_name)
       create_index_if_missing(alias_name, policy_name)
-      
-      # Cache to avoid future checks
+        # Mark as successfully created
       @dynamic_templates_created.put(alias_name, true)
       
-      logger.info("ILM resources ready", 
+      logger.info("=== ILM resources ready, lock released ===", 
                   :container => alias_name,
                   :policy => policy_name,
                   :template => template_name,
                   :alias => alias_name)
     rescue => e
       # Don't cache on failure - will retry on next event
+      @dynamic_templates_created.remove(alias_name)
       logger.error("Failed to initialize ILM resources - will retry on next event", 
                    :container => alias_name, 
                    :error => e.message,
@@ -89,9 +116,18 @@ module LogStash; module Outputs; class ElasticSearch  module DynamicTemplateMana
         
         # Clear cache - next retry will recreate resources
         @dynamic_templates_created.remove(alias_name)
+      end    end
+    private
+    
+    # Quick check if alias exists (lightweight, no exceptions)
+    def verify_alias_exists(alias_name)
+      begin
+        @client.rollover_alias_exists?(alias_name)
+      rescue => e
+        logger.debug("Error checking alias existence", :alias => alias_name, :error => e.message)
+        false
       end
     end
-    private
     
     # Create ILM policy (idempotent - only creates if missing)
     def create_policy_if_missing(policy_name)
@@ -124,13 +160,20 @@ module LogStash; module Outputs; class ElasticSearch  module DynamicTemplateMana
       
       logger.info("Template ready", :template => template_name, :priority => priority)
     end
-    
-    # Create first index with write alias (idempotent - only creates if missing)
+      # Create first index with write alias (idempotent - only creates if missing)
     def create_index_if_missing(alias_name, policy_name)
       # Check if alias exists
       if @client.rollover_alias_exists?(alias_name)
         logger.debug("Index/alias already exists", :alias => alias_name)
         return
+      end
+      
+      # Check if a simple index exists with the same name as the alias
+      # This can happen if Elasticsearch auto-created it during a brief gap
+      if simple_index_exists?(alias_name)
+        logger.warn("Found simple index with alias name - deleting and recreating properly", 
+                    :index => alias_name)
+        delete_simple_index(alias_name)
       end
       
       # Create first rollover index with date pattern
@@ -159,7 +202,7 @@ module LogStash; module Outputs; class ElasticSearch  module DynamicTemplateMana
                   :index => first_index_name, 
                   :alias => alias_name,
                   :policy => policy_name)
-    end    
+    end
     # Check if child templates exist for a base name (simple version)
     def has_child_templates?(base_name)
       begin
@@ -360,6 +403,38 @@ module LogStash; module Outputs; class ElasticSearch  module DynamicTemplateMana
             "created_by" => "logstash-output-elasticsearch"
           }
         }
+      end
+    end
+
+    # Check if a simple index (not an alias) exists with the given name
+    def simple_index_exists?(index_name)
+      begin
+        response = @client.pool.get("#{index_name}")
+        # If we get a response, check if it's an index (not an alias)
+        # An index response will have settings, mappings, etc.
+        return response && response[index_name] && response[index_name]['settings']
+      rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+        # 404 means it doesn't exist - that's fine
+        return false if e.response_code == 404
+        # Other errors - log and assume it doesn't exist
+        logger.debug("Error checking if simple index exists", :index => index_name, :error => e.message)
+        return false
+      rescue => e
+        logger.debug("Error checking if simple index exists", :index => index_name, :error => e.message)
+        return false
+      end
+    end
+    
+    # Delete a simple index (used to clean up auto-created indices)
+    def delete_simple_index(index_name)
+      begin
+        @client.pool.delete(index_name)
+        logger.info("Deleted auto-created simple index", :index => index_name)
+      rescue => e
+        logger.warn("Failed to delete simple index - will retry", 
+                    :index => index_name, 
+                    :error => e.message)
+        raise e
       end
     end
   end
