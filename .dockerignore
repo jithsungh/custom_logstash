@@ -9,12 +9,6 @@ CONTRIBUTORS
 LICENSE
 NOTICE.TXT
 
-# Exclude the embedded logstash directory
-logstash/
-
-# Exclude rskcontentadapter
-rskcontentadapter/
-
 # Exclude examples
 examples/
 
