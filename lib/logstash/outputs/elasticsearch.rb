@@ -291,15 +291,17 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
 
     check_action_validity
 
-    @logger.info("New Elasticsearch output", :class => self.class.name, :hosts => @hosts.map(&:sanitized).map(&:to_s))    # the license_checking behaviour in the Pool class is externalized in the LogStash::ElasticSearchOutputLicenseChecker
+    @logger.info("New Elasticsearch output", :class => self.class.name, :hosts => @hosts.map(&:sanitized).map(&:to_s))    
+    
+    # the license_checking behaviour in the Pool class is externalized in the LogStash::ElasticSearchOutputLicenseChecker
     # class defined in license_check.rb. This license checking is specific to the elasticsearch output here and passed
     # to build_client down to the Pool class.
     @client = build_client(LicenseChecker.new(@logger))
-    
+
     # Avoids race conditions in the @data_stream_config initialization (invoking check_data_stream_config! twice).
     # It's being concurrently invoked by this register method and by the finish_register on the @after_successful_connection_thread
     data_stream_enabled = data_stream_config?
-    
+
     setup_template_manager_defaults(data_stream_enabled)
     # To support BWC, we check if DLQ exists in core (< 5.4). If it doesn't, we use nil to resort to previous behavior.
     @dlq_writer = dlq_enabled? ? execution_context.dlq_writer : nil
@@ -418,7 +420,7 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
   FailedEventMapping = Struct.new(:event, :message)
   
   private
-    def safe_interpolation_map_events(events)
+  def safe_interpolation_map_events(events)
     successful_events = [] # list of LogStash::Outputs::ElasticSearch::EventActionTuple
     event_mapping_errors = [] # list of FailedEventMapping
     
