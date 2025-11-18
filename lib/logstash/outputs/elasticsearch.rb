@@ -631,7 +631,9 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
     return event_pipeline if event_pipeline && !@pipeline
     pipeline_template = @pipeline || event.get("[@metadata][target_ingest_pipeline]")&.to_s
     pipeline_template && event.sprintf(pipeline_template)
-  end    def resolve_dynamic_rollover_alias(event)
+  end    
+  
+  def resolve_dynamic_rollover_alias(event)
     return nil unless ilm_in_use? && @ilm_rollover_alias_template
     
     # Perform sprintf substitution on the rollover alias template
