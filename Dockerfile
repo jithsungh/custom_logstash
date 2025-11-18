@@ -33,6 +33,8 @@ RUN find /tmp/logstash-output-elasticsearch -type f \( -name "*.rb" -o -name "*.
 # Build the gem using system gem (since we installed ruby-dev)
 RUN gem build logstash-output-elasticsearch.gemspec
 
+ENV LS_JAVA_OPTS="-Xms2g -Xmx2g"
+
 # Install the built gem using logstash-plugin
 RUN /usr/share/logstash/bin/logstash-plugin install --no-verify /tmp/logstash-output-elasticsearch/logstash-output-elasticsearch-*.gem
 
