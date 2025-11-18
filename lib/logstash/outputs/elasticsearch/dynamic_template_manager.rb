@@ -30,32 +30,30 @@ module LogStash
       # putIfAbsent returns nil if key was absent (we won the race), 
       # or the previous value if key already existed (another thread has it)
       previous_value = @dynamic_templates_created.putIfAbsent(alias_name, "initializing")
-      
-      if previous_value.nil?
+        if previous_value.nil?
         # We won the race! Key was absent, we now hold the lock with "initializing"
-        logger.info("=== Lock acquired, proceeding with initialization ===", :container => alias_name)
+        logger.info("Lock acquired, proceeding with initialization", :container => alias_name)
         # Continue to resource creation below
       else
         # Another thread already grabbed the lock (previous_value is "initializing" or true)
-        logger.debug("=== Another thread holds lock, waiting ===", 
+        logger.debug("Another thread holds lock, waiting", 
                      :container => alias_name, 
                      :lock_value => previous_value)
         
         # If it's already fully created, return immediately
         return if previous_value == true
-        
-        # Otherwise wait for initialization to complete (another thread is working on it)
+          # Otherwise wait for initialization to complete (another thread is working on it)
         50.times do
           sleep 0.1
           current = @dynamic_templates_created.get(alias_name)
           if current == true
-            logger.debug("=== Initialization complete by other thread ===", :container => alias_name)
+            logger.debug("Initialization complete by other thread", :container => alias_name)
             return
           end
         end
         
-        logger.warn("=== Timeout waiting for initialization, skipping ===", :container => alias_name)
-        return
+        logger.error("Timeout waiting for ILM initialization - will retry", :container => alias_name)
+        raise StandardError.new("Timeout waiting for container #{alias_name} ILM initialization")
       end
       
       logger.info("Initializing ILM resources for new container", :container => alias_name)
@@ -68,11 +66,10 @@ module LogStash
       # Each method is idempotent (safe to call multiple times)
       create_policy_if_missing(policy_name)
       create_template_if_missing(template_name, alias_name, policy_name)
-      create_index_if_missing(alias_name, policy_name)
-        # Mark as successfully created
+      create_index_if_missing(alias_name, policy_name)      # Mark as successfully created
       @dynamic_templates_created.put(alias_name, true)
       
-      logger.info("=== ILM resources ready, lock released ===", 
+      logger.info("ILM resources ready, lock released", 
                   :container => alias_name,
                   :policy => policy_name,
                   :template => template_name,
@@ -154,14 +151,13 @@ module LogStash
       
       logger.info("Created ILM policy", :policy => policy_name)
     end
-    
-    # Create template (idempotent - only creates if missing)
+      # Create template (idempotent - only creates if missing)
     def create_template_if_missing(template_name, base_name, policy_name)
       index_pattern = "#{base_name}-*"
       
-      # Determine priority: parent=50, child=100
-      has_children = has_child_templates?(base_name)
-      priority = has_children ? 50 : 100
+      # All dynamic templates use priority 100 for simplicity
+      # Elasticsearch will match the most specific pattern automatically
+      priority = 100
       
       template = build_dynamic_template(index_pattern, policy_name, priority)
       endpoint = TemplateManager.send(:template_endpoint, self)
@@ -170,7 +166,7 @@ module LogStash
       @client.template_install(endpoint, template_name, template, false)
       
       logger.info("Template ready", :template => template_name, :priority => priority)
-    end    # Create first index with write alias (idempotent - only creates if missing)
+    end# Create first index with write alias (idempotent - only creates if missing)
     def create_index_if_missing(alias_name, policy_name)
       # DEFENSIVE: Loop to handle auto-creation race conditions
       max_attempts = 3
@@ -293,7 +289,7 @@ module LogStash
         policy["policy"]["phases"]["delete"] = delete_phase
       end
         policy
-    end      # Build a template for dynamic ILM indices
+    end    # Build a template for dynamic ILM indices
     def build_dynamic_template(index_pattern, policy_name, priority = 100)
       logger.debug("Building dynamic template", 
                    :index_pattern => index_pattern, 
@@ -311,21 +307,14 @@ module LogStash
           template = TemplateManager.send(:load_default_template, maximum_seen_major_version, ecs_compatibility)
         end
       rescue => e
-        logger.warn("Could not load template file, creating minimal template programmatically", :error => e.message)
+        logger.warn("Could not load template file - will create minimal template", :error => e.message)
         template = nil
       end
       
-      # If template loading failed, create a minimal template programmatically
-      if template.nil?
-        logger.info("Creating minimal dynamic template programmatically", 
-                    :index_pattern => index_pattern, 
-                    :policy_name => policy_name,
-                    :priority => priority)
-        template = create_minimal_template(index_pattern, policy_name, priority)
-      else        # Set the index pattern
+      # Use loaded template or create minimal one
+      if template && !template.empty?
+        # Modify loaded template with dynamic settings
         template['index_patterns'] = [index_pattern]
-        
-        # Set priority
         template['priority'] = priority
         
         # Remove legacy template key if present
@@ -333,13 +322,18 @@ module LogStash
         
         # Add ILM settings
         settings = TemplateManager.send(:resolve_template_settings, self, template)
-        
-        # Set the dynamically created policy name (not the default policy)
         settings.update({ 'index.lifecycle.name' => policy_name })
+      else
+        # Create minimal template programmatically
+        logger.info("Creating minimal dynamic template programmatically", 
+                    :index_pattern => index_pattern, 
+                    :policy_name => policy_name,
+                    :priority => priority)
+        template = create_minimal_template(index_pattern, policy_name, priority)
       end
       
       template
-    end      # Create a minimal index template programmatically when template files are unavailable
+    end# Create a minimal index template programmatically when template files are unavailable
     def create_minimal_template(index_pattern, policy_name, priority = 100)
       es_major_version = maximum_seen_major_version
       
@@ -446,7 +440,7 @@ module LogStash
         response = @client.pool.get(index_name)
         parsed = LogStash::Json.load(response.body)
         
-        logger.warn("=== SIMPLE INDEX CHECK RESPONSE ===", :index => index_name, :response => parsed)
+        logger.debug("Simple index check response", :index => index_name, :has_data => !parsed.nil?)
         
         # If we get a 200 response with index details, it's a simple index
         # Response format: { "index_name" => { "aliases" => {...}, "mappings" => {...}, "settings" => {...} } }
@@ -461,13 +455,13 @@ module LogStash
           # 3. It has aliases but none with is_write_index: true
           
           if aliases.empty?
-            logger.warn("=== FOUND SIMPLE INDEX (no aliases) ===", :index => index_name)
+            logger.warn("Found simple index (no aliases)", :index => index_name)
             return true
           else
             # Check if any alias has is_write_index: true
             has_write_alias = aliases.values.any? { |alias_def| alias_def['is_write_index'] == true }
             if !has_write_alias
-              logger.warn("=== FOUND SIMPLE INDEX (no write alias) ===", :index => index_name, :aliases => aliases.keys)
+              logger.warn("Found simple index (no write alias)", :index => index_name, :aliases => aliases.keys)
               return true
             end
           end
@@ -477,7 +471,7 @@ module LogStash
       rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
         # 404 means it doesn't exist - that's fine
         if e.response_code == 404
-          logger.debug("=== INDEX DOES NOT EXIST (404) ===", :index => index_name)
+          logger.debug("Index does not exist (404)", :index => index_name)
           return false
         end
         # Other errors - log and assume it doesn't exist

@@ -659,14 +659,9 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
     # NOTE: We don't call ensure_rollover_alias_exists here anymore
     # That's handled by maybe_create_dynamic_template in safe_interpolation_map_events
     # This avoids duplicate calls for every event
-    
-    resolved_alias
+      resolved_alias
   end
-
-  # private :resolve_dynamic_rollover_alias
   private :resolve_dynamic_rollover_alias
-  
-  # private :ensure_rollover_alias_exists
 
   @@plugins = Gem::Specification.find_all{|spec| spec.name =~ /logstash-output-elasticsearch-/ }
 
