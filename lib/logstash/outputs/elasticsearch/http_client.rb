@@ -529,13 +529,13 @@ module LogStash; module Outputs; class ElasticSearch;
                   :index => first_index_name,
                   :alias => alias_name,
                   :payload_size => index_payload_json.bytesize)
-      
-      # Create the index with the alias
+        # Create the index with the alias
       @pool.put(first_index_name, nil, index_payload_json)
       
       logger.info("Created rollover index", 
                   :index => first_index_name,
-                  :alias => alias_name)    rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+                  :alias => alias_name)
+    rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
       if e.response_code == 400
         response_body = e.response_body.to_s
         
