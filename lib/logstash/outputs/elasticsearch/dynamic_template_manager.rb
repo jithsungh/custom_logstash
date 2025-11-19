@@ -6,6 +6,8 @@ module LogStash
         # Thread-safe cache to track which containers have been initialized
         def initialize_dynamic_template_cache
           @dynamic_templates_created ||= java.util.concurrent.ConcurrentHashMap.new
+          # Cache last checked day per alias to avoid repeated rollover checks
+          @alias_rollover_checked_date ||= java.util.concurrent.ConcurrentHashMap.new
         end
         
         # SIMPLIFIED: Create ILM resources (policy, template, index) for a container
@@ -183,7 +185,7 @@ module LogStash
             # Extract date from index name (format: alias-YYYY.MM.DD-NNNNNN)
             if write_index =~ /-(\d{4}\.\d{2}\.\d{2})-\d+$/
               index_date = $1
-              today = Time.now.strftime("%Y.%m.%d")
+              today = current_date_str
               
               if index_date != today
                 logger.info("Write index has old date, triggering rollover", 
@@ -224,7 +226,7 @@ module LogStash
       end
       
       # Create first rollover index with date pattern
-      today = Time.now.strftime("%Y.%m.%d")
+      today = current_date_str
       first_index_name = "#{alias_name}-#{today}-000001"
       
       index_payload = {
@@ -541,7 +543,7 @@ module LogStash
     # Force a rollover to create a new index with today's date
     def force_rollover_with_new_date(alias_name, policy_name)
       begin
-        today = Time.now.strftime("%Y.%m.%d")
+        today = current_date_str
         
         # Trigger rollover API to create new index
         # Elasticsearch will automatically generate the next index with incremented number
@@ -613,6 +615,38 @@ module LogStash
           raise e
         end
       end
+    end
+
+    # Perform a lightweight daily check to ensure the write index matches today's date
+    # If the alias points to an index with yesterday's date, force a rollover to today's index
+    def maybe_rollover_for_new_day(alias_name)
+      return unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
+
+      today = current_date_str
+      last_checked = @alias_rollover_checked_date.get(alias_name)
+      return if last_checked == today
+
+      # mark as checked for today to avoid re-checking on every batch
+      @alias_rollover_checked_date.put(alias_name, today)
+
+      write_index = get_write_index_for_alias(alias_name)
+      return unless write_index
+
+      if write_index =~ /-(\d{4}\.\d{2}\.\d{2})-\d+$/
+        index_date = $1
+        if index_date != today
+          policy_name = "#{alias_name}-ilm-policy"
+          logger.info("Detected day change; forcing rollover to today's index", alias: alias_name, from: index_date, to: today)
+          force_rollover_with_new_date(alias_name, policy_name)
+        end
+      end
+    rescue => e
+      logger.warn("Daily rollover check failed - will try again later", alias: alias_name, error: e.message)
+    end
+
+    # Helper to provide consistent date formatting for index names
+    def current_date_str
+      Time.now.strftime("%Y.%m.%d")
     end
       end
     end
