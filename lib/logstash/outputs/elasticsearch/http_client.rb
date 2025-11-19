@@ -416,7 +416,7 @@ module LogStash; module Outputs; class ElasticSearch;
       raw_url = "#{raw_scheme}://#{postfixed_userinfo}#{raw_host}:#{raw_port}#{prefixed_raw_path}#{prefixed_raw_query}"
 
       ::LogStash::Util::SafeURI.new(raw_url)
-    end
+    end    
 
     def exists?(path, use_get=false)
       response = use_get ? @pool.get(path) : @pool.head(path)
@@ -429,32 +429,140 @@ module LogStash; module Outputs; class ElasticSearch;
     def template_exists?(template_endpoint, name)
       exists?("/#{template_endpoint}/#{name}")
     end
+    
+    # Get templates from Elasticsearch
+    # Returns a hash of template_name => template_definition
+    def get_template(template_endpoint, name_pattern = "*")
+      raise ArgumentError, "Invalid pattern" if name_pattern.nil? || name_pattern.strip.empty?
+    
+      path = "/#{template_endpoint}/#{name_pattern}"
+    
+      begin
+        response = @pool.get(path)
+        body = LogStash::Json.load(response.body)
+    
+        body.is_a?(Hash) ? body : {}
+      rescue LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+        if e.response_code == 404
+          {}
+        else
+          logger.warn(
+            "Failed to get templates",
+            path: path,
+            response_code: e.response_code,
+            response_body: e.response_body
+          )
+          nil
+        end
+      rescue LogStash::Json::ParserError => e
+        logger.error("Invalid JSON from ES", path: path, body: response.body)
+        nil
+      rescue => e
+        logger.error("Unexpected error getting templates", path: path, error: e)
+        nil
+      end
+    end
+    
 
     def template_put(template_endpoint, name, template)
       path = "#{template_endpoint}/#{name}"
-      logger.info("Installing Elasticsearch template", name: name)
-      @pool.put(path, nil, LogStash::Json.dump(template))
+      template_json = LogStash::Json.dump(template)
+      
+      logger.info("Installing Elasticsearch template", 
+                  :name => name, 
+                  :path => path,
+                  :template_size => template_json.bytesize)
+      logger.debug("Template payload", :template => template_json)
+      
+      @pool.put(path, nil, template_json)
+      
+      logger.info("Successfully installed template", :name => name)
     rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+      # Log the actual error response for debugging
+      logger.error("Template installation failed", 
+                   :name => name,
+                   :path => path,
+                   :response_code => e.response_code,
+                   :response_body => e.response_body,
+                   :template_sent => template_json)
       raise e unless e.response_code == 404
     end
 
-    # ILM methods
-
-    # check whether rollover alias already exists
+    # ILM methods    # check whether rollover alias already exists
+    # This checks for an ALIAS, not an index with the same name
     def rollover_alias_exists?(name)
-      exists?(name)
-    end
-
-    # Create a new rollover alias
-    def rollover_alias_put(alias_name, alias_definition)
-      @pool.put(CGI::escape(alias_name), nil, LogStash::Json.dump(alias_definition))
-      logger.info("Created rollover alias", name: alias_name)
-      # If the rollover alias already exists, ignore the error that comes back from Elasticsearch
+      # Use _alias endpoint to check if this is actually an alias
+      response = @pool.get("_alias/#{CGI::escape(name)}")
+      true
     rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
-      if e.response_code == 400
-        logger.info("Rollover alias already exists, skipping", name: alias_name)
-        return
+      # 404 means alias doesn't exist
+      if e.response_code == 404
+        return false
       end
+      # Other errors should be raised
+      logger.error("Error checking if rollover alias exists", :alias => name, :response_code => e.response_code, :error => e.message)
+      raise e
+    end
+      # Create a new rollover alias with initial index
+    # This uses a bootstrap index creation approach that works around date math URL encoding issues
+    def rollover_alias_put(index_pattern, alias_definition)
+      # Extract the alias name from the definition
+      alias_name = alias_definition['aliases'].keys.first
+      
+      # Determine the actual index name to create
+      # If index_pattern is already a proper rollover name (not date-math pattern starting with <),
+      # use it directly. Otherwise, generate a date-based name.
+      if index_pattern.start_with?('<')
+        # Old date-math pattern like "<alias-{now/d}-000001>" - generate explicit name
+        today = Time.now.strftime("%Y.%m.%d")
+        first_index_name = "#{alias_name}-#{today}-000001"
+        logger.debug("Generated index name from date-math pattern", :index => first_index_name, :date => today)
+      else
+        # Already an explicit name like "alias-2025.11.18-000001" - use as-is
+        first_index_name = index_pattern
+        logger.debug("Using provided index name", :index => first_index_name)
+      end
+      
+      index_payload_json = LogStash::Json.dump(alias_definition)
+      
+      logger.debug("Prepared rollover index payload", 
+                  :index => first_index_name,
+                  :alias => alias_name,
+                  :payload_size => index_payload_json.bytesize)
+      
+      # Create the index with the alias
+      @pool.put(first_index_name, nil, index_payload_json)
+      
+      logger.info("Created rollover index", 
+                  :index => first_index_name,
+                  :alias => alias_name)    rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+      if e.response_code == 400
+        response_body = e.response_body.to_s
+        
+        if response_body.include?("resource_already_exists_exception")
+          # Index already exists - this is OK, just means another thread created it first
+          logger.debug("Index already exists, proceeding", :index => first_index_name)
+          return
+        elsif response_body.include?("invalid_alias_name_exception") && 
+              response_body.include?("an index or data stream exists with the same name as the alias")
+          # This should have been caught earlier by simple_index_exists? check
+          # but if we still hit it, provide a clear error
+          logger.error("FATAL: Index exists with same name as alias", 
+                      :alias => alias_name,
+                      :problem => "An index named '#{alias_name}' exists. This should have been auto-deleted.",
+                      :suggestion => "Try again - the next attempt should auto-clean it.")
+          raise StandardError.new("Cannot create alias '#{alias_name}': conflicting index exists")
+        else
+          logger.warn("Rollover index creation returned 400", 
+                      :index => first_index_name,
+                      :response_body => response_body)
+          return
+        end
+      end
+      logger.error("Rollover index creation failed", 
+                   :index => first_index_name,
+                   :response_code => e.response_code,
+                   :response_body => e.response_body)
       raise e
     end
 
