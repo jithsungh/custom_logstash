@@ -166,7 +166,7 @@ module LogStash
       @client.template_install(endpoint, template_name, template, false)
       
       logger.info("Template ready", :template => template_name, :priority => priority)
-    end# Create first index with write alias (idempotent - only creates if missing)
+    end    # Create first index with write alias (idempotent - only creates if missing)
     def create_index_if_missing(alias_name, policy_name)
       # DEFENSIVE: Loop to handle auto-creation race conditions
       max_attempts = 3
@@ -177,7 +177,29 @@ module LogStash
         
         # Check if alias exists
         if @client.rollover_alias_exists?(alias_name)
-          logger.debug("Index/alias already exists", :alias => alias_name)
+          # Alias exists - check if write index has today's date
+          write_index = get_write_index_for_alias(alias_name)
+          if write_index
+            # Extract date from index name (format: alias-YYYY.MM.DD-NNNNNN)
+            if write_index =~ /-(\d{4}\.\d{2}\.\d{2})-\d+$/
+              index_date = $1
+              today = Time.now.strftime("%Y.%m.%d")
+              
+              if index_date != today
+                logger.info("Write index has old date, triggering rollover", 
+                           :alias => alias_name,
+                           :current_write_index => write_index,
+                           :index_date => index_date,
+                           :today => today)
+                
+                # Force rollover to create index with today's date
+                force_rollover_with_new_date(alias_name, policy_name)
+                return
+              end
+            end
+          end
+          
+          logger.debug("Index/alias already exists with current date", :alias => alias_name)
           return
         end
         
@@ -492,6 +514,104 @@ module LogStash
                     :index => index_name, 
                     :error => e.message)
         raise e
+      end
+    end
+
+    # Get the current write index for an alias
+    def get_write_index_for_alias(alias_name)
+      begin
+        response = @client.pool.get("_alias/#{CGI::escape(alias_name)}")
+        parsed = LogStash::Json.load(response.body)
+        
+        # Response format: { "index-name" => { "aliases" => { "alias-name" => { "is_write_index" => true } } } }
+        parsed.each do |index_name, index_data|
+          aliases = index_data['aliases'] || {}
+          if aliases[alias_name] && aliases[alias_name]['is_write_index']
+            return index_name
+          end
+        end
+        
+        nil
+      rescue => e
+        logger.warn("Error getting write index for alias", :alias => alias_name, :error => e.message)
+        nil
+      end
+    end
+    
+    # Force a rollover to create a new index with today's date
+    def force_rollover_with_new_date(alias_name, policy_name)
+      begin
+        today = Time.now.strftime("%Y.%m.%d")
+        
+        # Trigger rollover API to create new index
+        # Elasticsearch will automatically generate the next index with incremented number
+        # But we need to override the index name to use today's date
+        
+        # First, find the highest number used for today's date pattern
+        new_index_name = find_next_index_name(alias_name, today)
+        
+        logger.info("Forcing rollover to new date-based index", 
+                   :alias => alias_name,
+                   :new_index => new_index_name)
+        
+        # Create the new index with proper settings
+        index_payload = {
+          'aliases' => {
+            alias_name => {
+              'is_write_index' => true
+            }
+          },
+          'settings' => {
+            'index' => {
+              'lifecycle' => {
+                'name' => policy_name,
+                'rollover_alias' => alias_name
+              }
+            }
+          }
+        }
+        
+        @client.rollover_alias_put(new_index_name, index_payload)
+        
+        logger.info("Successfully rolled over to new date-based index", 
+                   :alias => alias_name,
+                   :new_index => new_index_name)
+      rescue => e
+        logger.error("Failed to force rollover", 
+                    :alias => alias_name, 
+                    :error => e.message,
+                    :backtrace => e.backtrace.first(3))
+        # Don't raise - let the system continue with existing index
+      end
+    end
+    
+    # Find the next available index name for a given date
+    def find_next_index_name(alias_name, date_str)
+      begin
+        # Get all indices matching the pattern for today
+        pattern = "#{alias_name}-#{date_str}-*"
+        response = @client.pool.get("#{pattern}")
+        parsed = LogStash::Json.load(response.body)
+        
+        # Find the highest number used today
+        max_number = 0
+        parsed.keys.each do |index_name|
+          if index_name =~ /-#{Regexp.escape(date_str)}-(\d+)$/
+            number = $1.to_i
+            max_number = number if number > max_number
+          end
+        end
+        
+        # Return next number (or 000001 if none exist)
+        next_number = max_number + 1
+        "#{alias_name}-#{date_str}-#{next_number.to_s.rjust(6, '0')}"
+      rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+        # No indices exist for today - start with 000001
+        if e.response_code == 404
+          "#{alias_name}-#{date_str}-000001"
+        else
+          raise e
+        end
       end
     end
       end
