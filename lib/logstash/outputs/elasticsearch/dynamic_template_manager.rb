@@ -544,25 +544,11 @@ module LogStash
     def force_rollover_with_new_date(alias_name, policy_name)
       begin
         today = current_date_str
-        
-        # Trigger rollover API to create new index
-        # Elasticsearch will automatically generate the next index with incremented number
-        # But we need to override the index name to use today's date
-        
-        # First, find the highest number used for today's date pattern
+        old_write = get_write_index_for_alias(alias_name)
         new_index_name = find_next_index_name(alias_name, today)
-        
-        logger.info("Forcing rollover to new date-based index", 
-                   :alias => alias_name,
-                   :new_index => new_index_name)
-        
-        # Create the new index with proper settings
+        logger.info("Forcing rollover to new date-based index", :alias => alias_name, :old_write_index => old_write, :new_index => new_index_name)
+        # Create new index WITHOUT alias to avoid multiple write_index conflict
         index_payload = {
-          'aliases' => {
-            alias_name => {
-              'is_write_index' => true
-            }
-          },
           'settings' => {
             'index' => {
               'lifecycle' => {
@@ -572,21 +558,37 @@ module LogStash
             }
           }
         }
-        
-        @client.rollover_alias_put(new_index_name, index_payload)
-        
-        logger.info("Successfully rolled over to new date-based index", 
-                   :alias => alias_name,
-                   :new_index => new_index_name)
+        @client.pool.put(new_index_name, {}, LogStash::Json.dump(index_payload))
+        # Atomically move alias write flag from old to new
+        reassign_write_alias(alias_name, old_write, new_index_name)
+        logger.info("Successfully rolled over to new date-based index", :alias => alias_name, :new_index => new_index_name)
       rescue => e
-        logger.error("Failed to force rollover", 
-                    :alias => alias_name, 
-                    :error => e.message,
-                    :backtrace => e.backtrace.first(3))
-        # Don't raise - let the system continue with existing index
+        logger.error("Failed to force rollover", :alias => alias_name, :error => e.message, :backtrace => e.backtrace.first(3))
+        # Cleanup if index created but alias not moved
+        begin
+          unless get_write_index_for_alias(alias_name) == new_index_name
+            @client.pool.delete(new_index_name)
+            logger.warn("Rolled back partial rollover (deleted new index)", :index => new_index_name)
+          end
+        rescue => cleanup_err
+          logger.warn("Failed cleanup after rollover error", :index => new_index_name, :error => cleanup_err.message)
+        end
       end
     end
     
+    # Atomically remove alias from old index and add to new index with write flag
+    def reassign_write_alias(alias_name, old_index, new_index)
+      actions = []
+      actions << { 'remove' => { 'index' => old_index, 'alias' => alias_name } } if old_index
+      actions << { 'add' => { 'index' => new_index, 'alias' => alias_name, 'is_write_index' => true } }
+      body = { 'actions' => actions }
+      @client.pool.post('/_aliases', {}, LogStash::Json.dump(body))
+      logger.debug("Alias reassigned", :alias => alias_name, :old_index => old_index, :new_index => new_index)
+    rescue => e
+      logger.error("Failed alias reassignment", :alias => alias_name, :error => e.message)
+      raise e
+    end
+
     # Find the next available index name for a given date
     def find_next_index_name(alias_name, date_str)
       begin
