@@ -120,19 +120,20 @@ module LogStash; module Outputs; class ElasticSearch
       template_version = es_major_version
       default_template_name = "templates/ecs-#{ecs_compatibility}/elasticsearch-#{template_version}x.json"
       ::File.expand_path(default_template_name, ::File.dirname(__FILE__))
-    end
-
+    end    
+    
     def self.read_template_file(template_path)
       raise LogStash::ConfigurationError, "Template file '#{template_path}' could not be found" unless ::File.exists?(template_path)
       template_data = ::IO.read(template_path)
       LogStash::Json.load(template_data)
     rescue => e
       raise LogStash::ConfigurationError, "Failed to load template file '#{template_path}': #{e.message}"
-    end    def self.template_endpoint(plugin)
-      index_template_api?(plugin) ? INDEX_TEMPLATE_ENDPOINT : LEGACY_TEMPLATE_ENDPOINT
     end
     
-    def self.index_template_api?(plugin)
+    def self.template_endpoint(plugin)
+      index_template_api?(plugin) ? INDEX_TEMPLATE_ENDPOINT : LEGACY_TEMPLATE_ENDPOINT
+    end
+      def self.index_template_api?(plugin)
       return true if plugin.serverless?
       
       case plugin.template_api
@@ -149,4 +150,4 @@ module LogStash; module Outputs; class ElasticSearch
     end
 
   end
-end
+end; end; end
