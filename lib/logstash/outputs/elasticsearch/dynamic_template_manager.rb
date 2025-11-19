@@ -171,6 +171,8 @@ module LogStash
       
       logger.info("Template ready", :template => template_name, :priority => priority)
     end    # Create first index with write alias (idempotent - only creates if missing)
+    # NOTE: This creates the initial index, then ILM handles rollovers
+    # However, we also check if a manual rollover is needed for date-based naming
     def create_index_if_missing(alias_name, policy_name)
       # DEFENSIVE: Loop to handle auto-creation race conditions
       max_attempts = 3
@@ -181,7 +183,11 @@ module LogStash
         
         # Check if alias exists
         if @client.rollover_alias_exists?(alias_name)
-          logger.debug("Index/alias already exists", :alias => alias_name)
+          logger.debug("Alias already exists - checking if rollover needed", :alias => alias_name)
+          
+          # Check if the current write index has today's date
+          # If not, we may need to trigger a rollover for date-based indices
+          check_and_rollover_if_needed(alias_name)
           return
         end
         
@@ -196,7 +202,7 @@ module LogStash
           next
         end
         
-        # Neither alias nor simple index exists - safe to create
+        # Neither alias nor simple index exists - safe to create first index
         break
       end
       
@@ -205,7 +211,7 @@ module LogStash
         raise StandardError.new("Cannot create rollover index: auto-created index keeps reappearing")
       end
       
-      # Create first rollover index with date pattern
+      # Create first rollover index with date pattern: <alias>-<date>-000001
       today = Time.now.strftime("%Y.%m.%d")
       first_index_name = "#{alias_name}-#{today}-000001"
       
@@ -228,7 +234,7 @@ module LogStash
       
       # Verify the alias was created correctly (not as a simple index)
       if @client.rollover_alias_exists?(alias_name)
-        logger.info("Created and verified rollover index", 
+        logger.info("Created first rollover index - ILM will handle future rollovers", 
                     :index => first_index_name, 
                     :alias => alias_name,
                     :policy => policy_name)
@@ -236,6 +242,75 @@ module LogStash
         logger.error("Rollover index creation may have failed - alias not found after creation", 
                      :index => first_index_name,
                      :alias => alias_name)
+      end
+    end
+    
+    # Check if the current write index needs to be rolled over (for date-based indices)
+    # This is called when an alias already exists but we want daily indices
+    def check_and_rollover_if_needed(alias_name)
+      begin
+        # Get current write index
+        response = @client.pool.get("#{alias_name}/_alias")
+        parsed = LogStash::Json.load(response.body)
+        
+        # Find the write index
+        write_index = nil
+        parsed.each do |index_name, index_data|
+          aliases = index_data['aliases'] || {}
+          if aliases[alias_name] && aliases[alias_name]['is_write_index'] == true
+            write_index = index_name
+            break
+          end
+        end
+        
+        if write_index.nil?
+          logger.warn("No write index found for alias - ILM may handle this", :alias => alias_name)
+          return
+        end
+        
+        # Check if write index has today's date in its name
+        today = Time.now.strftime("%Y.%m.%d")
+        
+        if write_index.include?(today)
+          logger.debug("Write index has today's date - no rollover needed", 
+                       :alias => alias_name, 
+                       :write_index => write_index,
+                       :date => today)
+        else
+          logger.info("Write index has old date - triggering rollover for new day", 
+                      :alias => alias_name, 
+                      :current_write_index => write_index,
+                      :expected_date => today)
+          
+          # Trigger manual rollover to create index with today's date
+          trigger_manual_rollover(alias_name)
+        end
+        
+      rescue => e
+        logger.debug("Could not check rollover status - ILM will handle it", 
+                     :alias => alias_name, 
+                     :error => e.message)
+      end
+    end
+    
+    # Manually trigger a rollover to create a new index with today's date
+    def trigger_manual_rollover(alias_name)
+      begin
+        # Call Elasticsearch rollover API
+        # This will create a new index and update the write alias
+        rollover_response = @client.pool.post("#{alias_name}/_rollover", nil, LogStash::Json.dump({}))
+        
+        if rollover_response.code >= 200 && rollover_response.code < 300
+          logger.info("Successfully triggered manual rollover for new day", :alias => alias_name)
+        else
+          logger.warn("Rollover API returned unexpected code", 
+                      :alias => alias_name, 
+                      :code => rollover_response.code)
+        end
+      rescue => e
+        logger.warn("Failed to trigger manual rollover - ILM will handle it automatically", 
+                    :alias => alias_name, 
+                    :error => e.message)
       end
     end
     # Check if child templates exist for a base name (simple version)
