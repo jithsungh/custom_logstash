@@ -63,7 +63,6 @@ require "set"
 #
 class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
   declare_threadsafe!
-
   require "logstash/outputs/elasticsearch/license_checker"
   require "logstash/outputs/elasticsearch/http_client"
   require "logstash/outputs/elasticsearch/http_client_builder"
@@ -71,13 +70,14 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
   require "logstash/plugin_mixins/elasticsearch/common"
   require "logstash/outputs/elasticsearch/ilm"
   require "logstash/outputs/elasticsearch/data_stream_support"
+  require "logstash/outputs/elasticsearch/dynamic_template_manager"
   require 'logstash/plugin_mixins/ecs_compatibility_support'
   require 'logstash/plugin_mixins/deprecation_logger_support'
   require 'logstash/plugin_mixins/normalize_config_support'
 
   # Protocol agnostic methods
   include(LogStash::PluginMixins::ElasticSearch::Common)
-
+  include(LogStash::Outputs::ElasticSearch::DynamicTemplateManager)
   # Config normalization helpers
   include(LogStash::PluginMixins::NormalizeConfigSupport)
 
@@ -239,9 +239,29 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
   # appends “{now/d}-000001” by default for new index creation, subsequent rollover indices will increment based on this pattern i.e. “000002”
   # {now/d} is date math, and will insert the appropriate value automatically.
   config :ilm_pattern, :validate => :string, :default => '{now/d}-000001'
-
   # ILM policy to use, if undefined the default policy will be used.
   config :ilm_policy, :validate => :string, :default => DEFAULT_POLICY
+
+  # Dynamic ILM policy configuration options
+  # These settings apply when using dynamic rollover aliases (with sprintf placeholders like %{[container_name]})
+  
+  # Hot phase: Maximum age before rollover (e.g., "1d", "7d", "30d")
+  config :ilm_rollover_max_age, :validate => :string, :default => "1d"
+  
+  # Hot phase: Maximum size before rollover (e.g., "50gb", "100gb")
+  config :ilm_rollover_max_size, :validate => :string
+  
+  # Hot phase: Maximum number of documents before rollover
+  config :ilm_rollover_max_docs, :validate => :number
+  
+  # Hot phase: Index priority (higher priority indices are recovered first after a restart)
+  config :ilm_hot_priority, :validate => :number, :default => 50
+  
+  # Delete phase: Minimum age before deletion (e.g., "7d", "30d", "90d")
+  config :ilm_delete_min_age, :validate => :string, :default => "1d"
+  
+  # Enable/disable delete phase entirely
+  config :ilm_delete_enabled, :validate => :boolean, :default => true
 
   attr_reader :client
   attr_reader :default_index
@@ -250,6 +270,10 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
 
   def initialize(*params)
     super
+    # Store the original config value for event-based sprintf substitution
+    @ilm_rollover_alias_template = @ilm_rollover_alias
+    @dynamic_alias_mutex = Mutex.new
+    @created_aliases = Set.new
     setup_ecs_compatibility_related_defaults
     setup_compression_level!
   end
@@ -267,20 +291,21 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
 
     check_action_validity
 
-    @logger.info("New Elasticsearch output", :class => self.class.name, :hosts => @hosts.map(&:sanitized).map(&:to_s))
-
-    # the license_checking behaviour in the Pool class is externalized in the LogStash::ElasticSearchOutputLicenseChecker
+    @logger.info("New Elasticsearch output", :class => self.class.name, :hosts => @hosts.map(&:sanitized).map(&:to_s))    # the license_checking behaviour in the Pool class is externalized in the LogStash::ElasticSearchOutputLicenseChecker
     # class defined in license_check.rb. This license checking is specific to the elasticsearch output here and passed
     # to build_client down to the Pool class.
     @client = build_client(LicenseChecker.new(@logger))
-
+    
     # Avoids race conditions in the @data_stream_config initialization (invoking check_data_stream_config! twice).
     # It's being concurrently invoked by this register method and by the finish_register on the @after_successful_connection_thread
     data_stream_enabled = data_stream_config?
-
+    
     setup_template_manager_defaults(data_stream_enabled)
     # To support BWC, we check if DLQ exists in core (< 5.4). If it doesn't, we use nil to resort to previous behavior.
     @dlq_writer = dlq_enabled? ? execution_context.dlq_writer : nil
+
+    # Initialize dynamic template cache for per-container template creation
+    initialize_dynamic_template_cache
 
     @dlq_codes = DOC_DLQ_CODES.to_set
 
@@ -391,14 +416,34 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
 
   MapEventsResult = Struct.new(:successful_events, :event_mapping_errors)
   FailedEventMapping = Struct.new(:event, :message)
-
+  
   private
-  def safe_interpolation_map_events(events)
+    def safe_interpolation_map_events(events)
     successful_events = [] # list of LogStash::Outputs::ElasticSearch::EventActionTuple
     event_mapping_errors = [] # list of FailedEventMapping
+    
+    # Track which containers we've already processed in THIS batch to avoid duplicate checks
+    batch_processed_containers = Set.new
+    
     events.each do |event|
       begin
-        successful_events << @event_mapper.call(event)
+        event_action = @event_mapper.call(event)
+        successful_events << event_action
+        
+        # Create dynamic template for this index if using dynamic ILM rollover alias
+        # Only process each unique container ONCE per batch (massive performance improvement)
+        if ilm_in_use? && @ilm_rollover_alias&.include?('%{')
+          # EventActionTuple structure: [action, params, event_data]
+          # params contains :_index with the resolved index/alias name
+          params = event_action[1]
+          index_name = params[:_index] if params
+          
+          # Skip if we've already processed this container in this batch
+          if index_name && !batch_processed_containers.include?(index_name)
+            batch_processed_containers.add(index_name)
+            maybe_create_dynamic_template(index_name)
+          end
+        end
       rescue EventMappingError => ie
         event_mapping_errors << FailedEventMapping.new(event, ie.message)
       end
@@ -564,8 +609,13 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
     return event_id || nil
   end
   private :resolve_document_id
-
   def resolve_index!(event, event_index)
+    # If ILM is in use and we have a dynamic rollover alias template, resolve it per event
+    if ilm_in_use? && @ilm_rollover_alias_template && @ilm_rollover_alias_template.include?('%{')
+      resolved_alias = resolve_dynamic_rollover_alias(event)
+      return resolved_alias if resolved_alias
+    end
+    
     sprintf_index = @event_target.call(event)
     raise IndexInterpolationError, sprintf_index if sprintf_index.match(/%{.*?}/) && dlq_on_failed_indexname_interpolation
     # if it's not a data stream, sprintf_index is the @index with resolved placeholders.
@@ -581,7 +631,44 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
     return event_pipeline if event_pipeline && !@pipeline
     pipeline_template = @pipeline || event.get("[@metadata][target_ingest_pipeline]")&.to_s
     pipeline_template && event.sprintf(pipeline_template)
+  end    
+  
+  def resolve_dynamic_rollover_alias(event)
+    return nil unless ilm_in_use? && @ilm_rollover_alias_template
+    
+    # Perform sprintf substitution on the rollover alias template
+    resolved_alias = event.sprintf(@ilm_rollover_alias_template)
+    
+    # Validate that substitution actually happened (check for remaining placeholders)
+    if resolved_alias.include?('%{')
+      logger.warn("Field not found in event for ILM rollover alias - using default", 
+                  :template => @ilm_rollover_alias_template,
+                  :resolved => resolved_alias,
+                  :available_fields => event.to_hash.keys.take(10))
+      
+      # Fallback to default alias to avoid creating invalid index names
+      resolved_alias = @default_ilm_rollover_alias
+    end
+    
+    # IMPORTANT: Add "auto-" prefix to match the alias created by maybe_create_dynamic_template
+    # This prevents Elasticsearch auto-creation conflicts
+    resolved_alias = "auto-#{resolved_alias}"
+    
+    # NOTE: We don't call ensure_rollover_alias_exists here anymore
+    # That's handled by maybe_create_dynamic_template in safe_interpolation_map_events
+    # This avoids duplicate calls for every event
+    
+    resolved_alias
   end
+  private :resolve_dynamic_rollover_alias
+  private :resolve_dynamic_rollover_alias
+  
+  # OLD METHOD - REMOVED: Now using version from DynamicTemplateManager module
+  # which has proper logging and uses dynamic ILM policy names
+  # def ensure_rollover_alias_exists(alias_name)
+  #   ... old implementation ...
+  # end
+  # private :ensure_rollover_alias_exists
 
   @@plugins = Gem::Specification.find_all{|spec| spec.name =~ /logstash-output-elasticsearch-/ }
 

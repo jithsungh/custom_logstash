@@ -15,9 +15,15 @@ module LogStash; module Outputs; class ElasticSearch
                            "The legacy template API is slated for removal in Elasticsearch 9.")
       elsif plugin.template_api == 'legacy' && plugin.serverless?
         raise LogStash::ConfigurationError, "Invalid template configuration `template_api => legacy`. Serverless Elasticsearch does not support legacy template API."
+      end      # Skip static template creation if using dynamic ILM rollover alias
+      # Templates will be created per-container on first event
+      if plugin.ilm_in_use? && plugin.ilm_rollover_alias&.include?('%{')
+        plugin.logger.info("Skipping static template installation for dynamic ILM rollover alias. " +
+                          "Templates will be created automatically per container on first event.",
+                          :ilm_rollover_alias => plugin.ilm_rollover_alias)
+        return
       end
-
-
+      
       if plugin.template
         plugin.logger.info("Using mapping template from", :path => plugin.template)
         template = read_template_file(plugin.template)
@@ -26,8 +32,12 @@ module LogStash; module Outputs; class ElasticSearch
                                                                :ecs_compatibility => plugin.ecs_compatibility)
         template = load_default_template(plugin.maximum_seen_major_version, plugin.ecs_compatibility)
       end
-
-      add_ilm_settings_to_template(plugin, template) if plugin.ilm_in_use?
+      
+      if plugin.ilm_in_use?
+        result = add_ilm_settings_to_template(plugin, template)
+        return if result == :skip_template  # Skip template installation for dynamic ILM
+      end
+      
       plugin.logger.debug("Attempting to install template", template: template)
       install(plugin.client, template_endpoint(plugin), template_name(plugin), template, plugin.template_overwrite)
     end
@@ -42,13 +52,24 @@ module LogStash; module Outputs; class ElasticSearch
 
     def self.install(client, template_endpoint, template_name, template, template_overwrite)
       client.template_install(template_endpoint, template_name, template, template_overwrite)
-    end
-
+    end    
     def self.add_ilm_settings_to_template(plugin, template)
+      # Check if using dynamic rollover alias (contains sprintf placeholders)
+      if plugin.ilm_rollover_alias&.include?('%{')
+        # For dynamic aliases, skip template installation at startup
+        # Templates will be created dynamically per container when events arrive
+        plugin.logger.info("Skipping template installation at startup for dynamic ILM rollover alias", 
+                          :ilm_rollover_alias => plugin.ilm_rollover_alias)
+        plugin.logger.info("Templates and ILM policies will be created dynamically per container")
+        return :skip_template  # Signal to skip template installation
+      end
+      
+      # For static aliases, use the specific alias pattern
       # Overwrite any index patterns, and use the rollover alias. Use 'index_patterns' rather than 'template' for pattern
       # definition - remove any existing definition of 'template'
       template.delete('template') if template.include?('template') if plugin.maximum_seen_major_version == 7
       template['index_patterns'] = "#{plugin.ilm_rollover_alias}-*"
+      
       settings = resolve_template_settings(plugin, template)
       if settings && (settings['index.lifecycle.name'] || settings['index.lifecycle.rollover_alias'])
         plugin.logger.info("Overwriting index lifecycle name and rollover alias as ILM is enabled")
@@ -122,12 +143,11 @@ module LogStash; module Outputs; class ElasticSearch
           true
         when 'legacy'
           false
-        else
-          plugin.logger.warn("Invalid template_api value #{plugin.template_api}")
+        else          plugin.logger.warn("Invalid template_api value #{plugin.template_api}")
           true
         end
       end
     end
 
   end
-end end end
+end; end; end
