@@ -128,11 +128,11 @@ module LogStash; module Outputs; class ElasticSearch
       LogStash::Json.load(template_data)
     rescue => e
       raise LogStash::ConfigurationError, "Failed to load template file '#{template_path}': #{e.message}"
-    end
-
-    def self.template_endpoint(plugin)
+    end    def self.template_endpoint(plugin)
       index_template_api?(plugin) ? INDEX_TEMPLATE_ENDPOINT : LEGACY_TEMPLATE_ENDPOINT
-    end    def self.index_template_api?(plugin)
+    end
+    
+    def self.index_template_api?(plugin)
       return true if plugin.serverless?
       
       case plugin.template_api
