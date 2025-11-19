@@ -2,8 +2,7 @@ module LogStash; module Outputs; class ElasticSearch
   module Ilm
 
     ILM_POLICY_PATH = "default-ilm-policy.json"
-    
-    def setup_ilm
+      def setup_ilm
       logger.warn("Overwriting supplied index #{@index} with rollover alias #{@ilm_rollover_alias}") unless default_index?(@index)
       @index = @ilm_rollover_alias
       
@@ -11,8 +10,11 @@ module LogStash; module Outputs; class ElasticSearch
       if @ilm_rollover_alias&.include?('%{')
         logger.info("Using dynamic ILM rollover alias - aliases will be created per event", 
                     :template => @ilm_rollover_alias)
+        # Create default policy for fallback scenario (when field substitution fails)
+        maybe_create_ilm_policy if @default_ilm_rollover_alias
       else
         maybe_create_rollover_alias
+        maybe_create_ilm_policy
       end
     end
 
