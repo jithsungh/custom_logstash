@@ -3,14 +3,16 @@ module LogStash
     class ElasticSearch
       module DynamicTemplateManager
     
-        # Thread-safe cache to track which containers have been initialized
-        def initialize_dynamic_template_cache
-          @dynamic_templates_created ||= java.util.concurrent.ConcurrentHashMap.new
-          # Cache last checked day per alias to avoid repeated rollover checks
-          @alias_rollover_checked_date ||= java.util.concurrent.ConcurrentHashMap.new
-        end
-        
-        # SIMPLIFIED: Create ILM resources (policy, template, index) for a container
+    # Thread-safe cache to track which containers have been initialized
+    def initialize_dynamic_template_cache
+      @dynamic_templates_created ||= java.util.concurrent.ConcurrentHashMap.new
+      # Cache last checked day per alias to avoid repeated rollover checks
+      @alias_rollover_checked_date ||= java.util.concurrent.ConcurrentHashMap.new
+      # Cache resource existence to avoid redundant API calls
+      @resource_exists_cache ||= java.util.concurrent.ConcurrentHashMap.new
+      
+    end
+          # SIMPLIFIED: Create ILM resources (policy, template, index) for a container
         # Called ONLY ONCE per container (first event), then cached
         # Auto-recovers ONLY on index-related errors (not policy/template errors)
         def maybe_create_dynamic_template(index_name)
@@ -26,6 +28,8 @@ module LogStash
       # FAST PATH: If already created, skip entirely (no checks, no API calls)
       current_value = @dynamic_templates_created.get(alias_name)
       if current_value == true
+        # OPTIMIZATION: Check if we need daily rollover (very lightweight, once per day per alias)
+        maybe_rollover_for_new_day(alias_name)
         return
       end
         # THREAD-SAFE: Use putIfAbsent to ensure only ONE thread creates resources
@@ -83,8 +87,8 @@ module LogStash
                    :container => alias_name, 
                    :error => e.message,
                    :backtrace => e.backtrace.first(3))
-    end
-      # Handle indexing errors - ONLY recreate if index is missing
+    end      
+    # Handle indexing errors - ONLY recreate if index is missing
     # This is called by the bulk indexer when an error occurs
     def handle_dynamic_ilm_error(alias_name, error)
       return unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
@@ -101,13 +105,16 @@ module LogStash
                       error_message.include?('indexnotfound')
       
       if index_missing
-        logger.warn("Index missing, recreating", 
+        logger.warn("Index missing, clearing cache for recreation", 
                     :container => alias_name,
                     :error => error.message)
         
-        # Clear cache and recreate
+        # Clear all caches related to this alias
         @dynamic_templates_created.remove(alias_name)
-        maybe_create_dynamic_template(alias_name)
+        @resource_exists_cache.remove("policy:#{alias_name}-ilm-policy")
+        @resource_exists_cache.remove("template:logstash-#{alias_name}")
+        
+        # Next event will recreate resources
       end
     end
     
@@ -121,12 +128,15 @@ module LogStash
       if action && action[1] && action[1][:_index]
         alias_name = action[1][:_index]
         
-        logger.warn("Index not found error detected, clearing cache for next retry", 
+        logger.warn("Index not found error detected, clearing all caches for next retry", 
                     :alias => alias_name)
         
-        # Clear cache - next retry will recreate resources
+        # Clear all caches - next retry will recreate resources
         @dynamic_templates_created.remove(alias_name)
-      end    end
+        @resource_exists_cache.remove("policy:#{alias_name}-ilm-policy")
+        @resource_exists_cache.remove("template:logstash-#{alias_name}")
+      end    
+    end
     private
     
     # Quick check if alias exists (lightweight, no exceptions)
@@ -138,22 +148,28 @@ module LogStash
         false
       end
     end
-    
-    # Create ILM policy (idempotent - only creates if missing)
+      # Create ILM policy (idempotent - only creates if missing)
     def create_policy_if_missing(policy_name)
-      # Check if exists first
+      # Check cache first to avoid API call
+      cache_key = "policy:#{policy_name}"
+      return if @resource_exists_cache.get(cache_key) == true
+      
+      # Check if exists in Elasticsearch
       if @client.ilm_policy_exists?(policy_name)
         logger.debug("Policy already exists", :policy => policy_name)
+        @resource_exists_cache.put(cache_key, true)
         return
       end
       
       # Create policy
       policy_payload = build_dynamic_ilm_policy
       @client.ilm_policy_put(policy_name, policy_payload)
+      @resource_exists_cache.put(cache_key, true)
       
       logger.info("Created ILM policy", :policy => policy_name)
-    end
-      # Create template (idempotent - only creates if missing)
+    end      
+    
+    # Create template (idempotent - only creates if missing)
     def create_template_if_missing(template_name, base_name, policy_name)
       index_pattern = "#{base_name}-*"
       
@@ -161,14 +177,24 @@ module LogStash
       # Elasticsearch will match the most specific pattern automatically
       priority = 100
       
+      # Cache check to avoid API call
+      cache_key = "template:#{template_name}"
+      if @resource_exists_cache.get(cache_key) == true
+        logger.debug("Template exists (cached)", :template => template_name)
+        return
+      end
+      
       template = build_dynamic_template(index_pattern, policy_name, priority)
       endpoint = TemplateManager.send(:template_endpoint, self)
       
       # template_install is idempotent (won't overwrite existing)
       @client.template_install(endpoint, template_name, template, false)
+      @resource_exists_cache.put(cache_key, true)
       
       logger.info("Template ready", :template => template_name, :priority => priority)
-    end    # Create first index with write alias (idempotent - only creates if missing)
+    end
+    
+    # Create first index with write alias (idempotent - only creates if missing)
     def create_index_if_missing(alias_name, policy_name)
       # DEFENSIVE: Loop to handle auto-creation race conditions
       max_attempts = 3
@@ -258,6 +284,7 @@ module LogStash
                      :alias => alias_name)
       end
     end
+    
     # Check if child templates exist for a base name (simple version)
     def has_child_templates?(base_name)
       begin
@@ -617,19 +644,25 @@ module LogStash
           raise e
         end
       end
-    end
-
-    # Perform a lightweight daily check to ensure the write index matches today's date
+    end    # Perform a lightweight daily check to ensure the write index matches today's date
     # If the alias points to an index with yesterday's date, force a rollover to today's index
+    # OPTIMIZATION: Only called once per day per alias (cached check)
     def maybe_rollover_for_new_day(alias_name)
       return unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
 
       today = current_date_str
       last_checked = @alias_rollover_checked_date.get(alias_name)
+      
+      # FAST PATH: Already checked today, skip
       return if last_checked == today
 
-      # mark as checked for today to avoid re-checking on every batch
-      @alias_rollover_checked_date.put(alias_name, today)
+      # Mark as checked for today to avoid re-checking (thread-safe putIfAbsent)
+      # Only one thread will win this race and perform the check
+      previous = @alias_rollover_checked_date.putIfAbsent(alias_name, today)
+      return unless previous.nil? || previous != today
+      
+      # We won the race or date changed - perform the check
+      logger.debug("Performing daily rollover check", alias: alias_name, today: today, last_checked: previous)
 
       write_index = get_write_index_for_alias(alias_name)
       return unless write_index
@@ -640,10 +673,14 @@ module LogStash
           policy_name = "#{alias_name}-ilm-policy"
           logger.info("Detected day change; forcing rollover to today's index", alias: alias_name, from: index_date, to: today)
           force_rollover_with_new_date(alias_name, policy_name)
+        else
+          logger.debug("Write index date matches today, no rollover needed", alias: alias_name, index_date: index_date)
         end
       end
     rescue => e
       logger.warn("Daily rollover check failed - will try again later", alias: alias_name, error: e.message)
+      # Clear the date cache so it will retry later
+      @alias_rollover_checked_date.remove(alias_name)
     end
 
     # Helper to provide consistent date formatting for index names
@@ -652,5 +689,17 @@ module LogStash
     end
       end
     end
+    
+    # UTILITY: Clear all caches for a specific container (useful for manual intervention or testing)
+    # Can be called if you manually delete resources in Elasticsearch
+    def clear_container_cache(alias_name)
+      logger.info("Clearing all caches for container", :alias => alias_name)
+      @dynamic_templates_created.remove(alias_name)
+      @alias_rollover_checked_date.remove(alias_name)
+      @resource_exists_cache.remove("policy:#{alias_name}-ilm-policy")
+      @resource_exists_cache.remove("template:logstash-#{alias_name}")
+    end
+    
+    private
   end
 end
