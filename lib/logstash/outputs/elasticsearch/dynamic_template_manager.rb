@@ -13,10 +13,10 @@ module LogStash
       unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
         return
       end
-      
-      # NOTE: index_name already has "auto-" prefix added by resolve_dynamic_rollover_alias
+        # NOTE: index_name already has "auto-" prefix added by resolve_dynamic_rollover_alias
       # in lib/logstash/outputs/elasticsearch.rb (line 656)
-      # So we use it directly without adding another prefix      container_name = index_name
+      # So we use it directly without adding another prefix
+      container_name = index_name
       
       # Fast path: If already created, skip entirely (no checks, no API calls)
       current_value = @dynamic_templates_created.get(container_name)
@@ -24,11 +24,15 @@ module LogStash
         return
       end
       
+      # Build resource names early (needed for both success and error paths)
+      policy_name = "#{container_name}-ilm-policy"
+      template_name = "logstash-#{container_name}"
+      
       # Thread-safe: Use putIfAbsent to ensure only ONE thread creates resources
       # putIfAbsent returns nil if key was absent (we won the race), 
       # or the previous value if key already existed (another thread has it)
-      previous_value = @dynamic_templates_created.putIfAbsent(container_name, "initializing")
-        if previous_value.nil?
+      previous_value = @dynamic_templates_created.putIfAbsent(container_name, "initializing")        
+      if previous_value.nil?
         # We won the race! Key was absent, we now hold the lock with "initializing"
         logger.info("Lock acquired, proceeding with initialization", :container => container_name)
         # Continue to resource creation below
@@ -40,7 +44,8 @@ module LogStash
         
         # If it's already fully created, return immediately
         return if previous_value == true
-          # Otherwise wait for initialization to complete (another thread is working on it)
+        
+        # Otherwise wait for initialization to complete (another thread is working on it)
         50.times do
           sleep 0.1
           current = @dynamic_templates_created.get(container_name)
@@ -55,10 +60,6 @@ module LogStash
       end
       
       logger.info("Initializing ILM resources for new container", :container => container_name)
-      
-      # Build resource names
-      policy_name = "#{container_name}-ilm-policy"
-      template_name = "logstash-#{container_name}"
       
       # Create resources in order: policy → template → index
       # Each method is idempotent (safe to call multiple times)
