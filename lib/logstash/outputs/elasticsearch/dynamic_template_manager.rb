@@ -86,417 +86,410 @@ module LogStash
                        :error => e.message,
                        :backtrace => e.backtrace.first(3))
         end
-        
-        # Ensure the write alias points to today's index
+          # Ensure the write alias points to today's index
         # This handles daily rollover automatically
         def ensure_write_alias_current(container_name, policy_name)
-      today = current_date_str
-      today_index = "#{container_name}-#{today}"
-      
-      # Check if we've already verified this today (cache key includes date)
-      cache_key = "#{container_name}:#{today}"
-      if @write_alias_last_checked.get(cache_key)
-        return # Already checked today
-      end
-      
-      # If today's index doesn't exist, create it
-      unless index_exists?(today_index)
-        create_index_if_missing(container_name, policy_name)
-        @write_alias_last_checked.put(cache_key, true)
-        return
-      end
-      
-      # Check if the write alias is already pointing to today's index
-      begin
-        response = @client.pool.get("_alias/#{container_name}")
-        response_body = LogStash::Json.load(response.body)
-        
-        # Find which index has the write alias
-        response_body.each do |index_name, data|
-          aliases = data['aliases'] || {}
-          if aliases[container_name] && aliases[container_name]['is_write_index']
-            # If write alias already points to today's index, we're done
-            if index_name == today_index
-              @write_alias_last_checked.put(cache_key, true)
-              return
-            end
-            
-            # Otherwise, we need to move the write alias to today's index
-            logger.info("Moving write alias to today's index",
-                       :alias => container_name,
-                       :from => index_name,
-                       :to => today_index)
-            
-            # Move the write alias atomically
-            update_write_alias(container_name, today_index)
+          today = current_date_str
+          today_index = "#{container_name}-#{today}"
+          
+          # Check if we've already verified this today (cache key includes date)
+          cache_key = "#{container_name}:#{today}"
+          if @write_alias_last_checked.get(cache_key)
+            return # Already checked today
+          end
+          
+          # If today's index doesn't exist, create it
+          unless index_exists?(today_index)
+            create_index_if_missing(container_name, policy_name)
             @write_alias_last_checked.put(cache_key, true)
             return
+          end          
+          # Check if the write alias is already pointing to today's index
+          begin
+            response = @client.pool.get("_alias/#{container_name}")
+            response_body = LogStash::Json.load(response.body)
+            
+            # Find which index has the write alias
+            response_body.each do |index_name, data|
+              aliases = data['aliases'] || {}
+              if aliases[container_name] && aliases[container_name]['is_write_index']
+                # If write alias already points to today's index, we're done
+                if index_name == today_index
+                  @write_alias_last_checked.put(cache_key, true)
+                  return
+                end
+                
+                # Otherwise, we need to move the write alias to today's index
+                logger.info("Moving write alias to today's index",
+                           :alias => container_name,
+                           :from => index_name,
+                           :to => today_index)
+                
+                # Move the write alias atomically
+                update_write_alias(container_name, today_index)
+                @write_alias_last_checked.put(cache_key, true)
+                return
+              end
+            end
+            
+            # No write alias found - create it on today's index
+            logger.info("No write alias found, creating on today's index",
+                       :alias => container_name,
+                       :index => today_index)
+            update_write_alias(container_name, today_index)
+            @write_alias_last_checked.put(cache_key, true)
+            
+          rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+            if e.response_code == 404
+              # Alias doesn't exist - create it
+              logger.info("Alias not found, creating on today's index",
+                         :alias => container_name,
+                         :index => today_index)
+              update_write_alias(container_name, today_index)
+              @write_alias_last_checked.put(cache_key, true)
+            else
+              logger.warn("Error checking write alias", 
+                         :alias => container_name,
+                         :error => e.message)
+            end
+          end
+        end        
+        # Update the write alias to point to a specific index
+        def update_write_alias(alias_name, target_index)
+          payload = {
+            'actions' => [
+              {
+                'add' => {
+                  'index' => target_index,
+                  'alias' => alias_name,
+                  'is_write_index' => true
+                }
+              }
+            ]
+          }
+          
+          @client.pool.post('_aliases', {}, LogStash::Json.dump(payload))
+          logger.info("Updated write alias", :alias => alias_name, :index => target_index)
+        rescue => e
+          logger.error("Failed to update write alias",
+                      :alias => alias_name,
+                      :index => target_index,
+                      :error => e.message)
+        end        
+        # Handle indexing errors - recreate if index is missing
+        def handle_dynamic_ilm_error(container_name, error)
+          return unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
+          
+          error_message = error.message.to_s.downcase
+          
+          # Handle index-related errors only
+          index_missing = error_message.include?('index_not_found') ||
+                          error_message.include?('no such index') ||
+                          error_message.include?('indexnotfound')
+          
+          if index_missing
+            logger.warn("Index missing, recreating", 
+                        :container => container_name,
+                        :error => error.message)
+            
+            # Clear cache and recreate
+            @dynamic_templates_created.remove(container_name)
+            maybe_create_dynamic_template(container_name)
+          end
+        end        
+        # Called from common.rb when bulk indexing encounters index_not_found error
+        def handle_index_not_found_error(action)
+          return unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
+          
+          if action && action[1] && action[1][:_index]
+            container_name = action[1][:_index]
+            logger.warn("Index not found error detected, clearing cache for next retry", 
+                        :container => container_name)
+            @dynamic_templates_created.remove(container_name)
           end
         end
         
-        # No write alias found - create it on today's index
-        logger.info("No write alias found, creating on today's index",
-                   :alias => container_name,
-                   :index => today_index)
-        update_write_alias(container_name, today_index)
-        @write_alias_last_checked.put(cache_key, true)
-        
-      rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
-        if e.response_code == 404
-          # Alias doesn't exist - create it
-          logger.info("Alias not found, creating on today's index",
-                     :alias => container_name,
-                     :index => today_index)
-          update_write_alias(container_name, today_index)
-          @write_alias_last_checked.put(cache_key, true)
-        else
-          logger.warn("Error checking write alias", 
-                     :alias => container_name,
-                     :error => e.message)
-        end
-      end
-    end
-    
-    # Update the write alias to point to a specific index
-    def update_write_alias(alias_name, target_index)
-      payload = {
-        'actions' => [
-          {
-            'add' => {
-              'index' => target_index,
-              'alias' => alias_name,
-              'is_write_index' => true
-            }
-          }
-        ]
-      }
-      
-      @client.pool.post('_aliases', {}, LogStash::Json.dump(payload))
-      logger.info("Updated write alias", :alias => alias_name, :index => target_index)
-    rescue => e
-      logger.error("Failed to update write alias",
-                  :alias => alias_name,
-                  :index => target_index,
-                  :error => e.message)
-    end
-      
-      # Handle indexing errors - recreate if index is missing
-    def handle_dynamic_ilm_error(container_name, error)
-      return unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
-      
-      error_message = error.message.to_s.downcase
-      
-      # Handle index-related errors only
-      index_missing = error_message.include?('index_not_found') ||
-                      error_message.include?('no such index') ||
-                      error_message.include?('indexnotfound')
-      
-      if index_missing
-        logger.warn("Index missing, recreating", 
-                    :container => container_name,
-                    :error => error.message)
-        
-        # Clear cache and recreate
-        @dynamic_templates_created.remove(container_name)
-        maybe_create_dynamic_template(container_name)
-      end
-    end    
-    # Called from common.rb when bulk indexing encounters index_not_found error
-    def handle_index_not_found_error(action)
-      return unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
-      
-      if action && action[1] && action[1][:_index]
-        container_name = action[1][:_index]
-        logger.warn("Index not found error detected, clearing cache for next retry", 
-                    :container => container_name)
-        @dynamic_templates_created.remove(container_name)
-      end
-    end
-    
-    private
-    
-    # Check if an index exists (simple and reliable)
-    def index_exists?(index_name)
-      begin
-        response = @client.pool.head(index_name)
-        return true
-      rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
-        return false if e.response_code == 404
-        logger.warn("Error checking if index exists", :index => index_name, :error => e.message)
-        return false
-      rescue => e
-        logger.warn("Error checking if index exists", :index => index_name, :error => e.message)
-        return false
-      end
-    end
-    
-    # Create ILM policy (idempotent - only creates if missing)
-    def create_policy_if_missing(policy_name)
-      # Check if exists first
-      if @client.ilm_policy_exists?(policy_name)
-        logger.debug("Policy already exists", :policy => policy_name)
-        return
-      end
-      
-      # Create policy
-      policy_payload = build_dynamic_ilm_policy
-      @client.ilm_policy_put(policy_name, policy_payload)      
-      logger.info("Created ILM policy", :policy => policy_name)
-    end
-    
-    # Create template (idempotent - only creates if missing)
-    def create_template_if_missing(template_name, base_name, policy_name)
-      index_pattern = "#{base_name}-*"
-      
-      # All dynamic templates use priority 100 for simplicity
-      # Elasticsearch will match the most specific pattern automatically
-      priority = 100
-      
-      template = build_dynamic_template(index_pattern, policy_name, priority)
-      endpoint = TemplateManager.send(:template_endpoint, self)
-      
-      # template_install is idempotent (won't overwrite existing)
-      @client.template_install(endpoint, template_name, template, false)      
-      logger.info("Template ready", :template => template_name, :priority => priority)
-    end      # Create first index with date-based naming (idempotent)
-    def create_index_if_missing(container_name, policy_name)
-      today = current_date_str
-      index_name = "#{container_name}-#{today}"
-      
-      # Check if today's index already exists
-      if index_exists?(index_name)
-        logger.debug("Index already exists for today", :index => index_name)
-        return index_name
-      end
-      
-      # Create today's index with ILM policy AND write alias
-      logger.info("Creating new index for container", 
-                  :container => container_name,
-                  :index => index_name,
-                  :policy => policy_name)
-      
-      # Configure both settings AND alias in a single request
-      index_payload = {
-        'settings' => {
-          'index' => {
-            'lifecycle' => {
-              'name' => policy_name
-            },
-            'number_of_shards' => (@number_of_shards || 1).to_s,
-            'number_of_replicas' => (@number_of_replicas || 0).to_s
-          }
-        },
-        'aliases' => {
-          # Create write alias pointing to this index
-          # This allows events to be sent to "auto-uibackend" and be routed to the current day's index
-          container_name => {
-            'is_write_index' => true
-          }
-        }
-      }
-      
-      begin
-        @client.pool.put(index_name, {}, LogStash::Json.dump(index_payload))
-        logger.info("Successfully created index with write alias", 
-                    :index => index_name,
-                    :alias => container_name,
-                    :container => container_name,
-                    :policy => policy_name)
-        return index_name
-      rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
-        # 400 with "resource_already_exists_exception" means index was created by another thread - that's OK
-        if e.response_code == 400 && e.message.to_s.include?('resource_already_exists')
-          logger.debug("Index already created by another thread", :index => index_name)
-          return index_name
-        else
-          raise e
-        end
-      end
-    end
-    
-    # Build ILM policy payload based on configuration
-    def build_dynamic_ilm_policy
-      policy = {
-        "policy" => {
-          "phases" => {}
-        }
-      }
-      
-      # Hot phase configuration
-      hot_phase = {
-        "min_age" => "0ms",
-        "actions" => {}
-      }
-      
-      # Set priority
-      hot_phase["actions"]["set_priority"] = {
-        "priority" => @ilm_hot_priority
-      }
-      
-      policy["policy"]["phases"]["hot"] = hot_phase
-      
-      # Delete phase configuration (if enabled)
-      if @ilm_delete_enabled
-        delete_phase = {
-          "min_age" => @ilm_delete_min_age,
-          "actions" => {
-            "delete" => {
-              "delete_searchable_snapshot" => true
-            }
-          }
-        }        
-        policy["policy"]["phases"]["delete"] = delete_phase
-      end
-      
-      policy
-    end
-    
-    # Build a template for dynamic ILM indices
-    def build_dynamic_template(index_pattern, policy_name, priority = 100)
-      logger.debug("Building dynamic template", 
-                   :index_pattern => index_pattern, 
-                   :policy_name => policy_name,
-                   :priority => priority)
-      
-      # Try to load a custom or default template if available
-      template = nil
-      begin
-        if @template
-          logger.debug("Loading custom template file", :template => @template)
-          template = TemplateManager.send(:read_template_file, @template)
-        else
-          logger.debug("Attempting to load default template", :es_version => maximum_seen_major_version, :ecs_compatibility => ecs_compatibility)
-          template = TemplateManager.send(:load_default_template, maximum_seen_major_version, ecs_compatibility)
-        end
-      rescue => e
-        logger.warn("Could not load template file - will create minimal template", :error => e.message)
-        template = nil
-      end
-      
-      # Use loaded template or create minimal one
-      if template && !template.empty?
-        # Modify loaded template with dynamic settings
-        template['index_patterns'] = [index_pattern]
-        template['priority'] = priority
-        
-        # Remove legacy template key if present
-        template.delete('template') if template.include?('template') && maximum_seen_major_version == 7
-        
-        # Add ILM settings
-        settings = TemplateManager.send(:resolve_template_settings, self, template)
-        settings.update({ 'index.lifecycle.name' => policy_name })
-      else
-        # Create minimal template programmatically
-        logger.info("Creating minimal dynamic template programmatically", 
-                    :index_pattern => index_pattern, 
-                    :policy_name => policy_name,
-                    :priority => priority)
-        template = create_minimal_template(index_pattern, policy_name, priority)
-      end      
-      template
-    end
-    
-    # Create a minimal index template programmatically when template files are unavailable
-    def create_minimal_template(index_pattern, policy_name, priority = 100)      es_major_version = maximum_seen_major_version
-      
-      # Base settings with ILM configuration
-      base_settings = {
-        "index" => {
-          "lifecycle" => {
-            "name" => policy_name
-          },
-          "routing" => {
-            "allocation" => {
-              "include" => {
-                "_tier_preference" => "data_content"
-              }
-            }
-          },
-          "refresh_interval" => "5s",
-          "number_of_shards" => (@number_of_shards || 1).to_s,
-          "number_of_replicas" => (@number_of_replicas || 0).to_s
-        }
-      }
-      
-      # Common mappings structure for both ES 7 and 8
-      common_mappings = {
-        "dynamic_templates" => [
-          {
-            "message_field" => {
-              "path_match" => "message",
-              "match_mapping_type" => "string",
-              "mapping" => {
-                "norms" => false,
-                "type" => "text"
-              }
-            }
-          },
-          {
-            "string_fields" => {
-              "match" => "*",
-              "match_mapping_type" => "string",
-              "mapping" => {
-                "fields" => {
-                  "keyword" => {
-                    "ignore_above" => 256,
-                    "type" => "keyword"
-                  }
+        private        
+        # Check if an index exists (simple and reliable)
+        def index_exists?(index_name)
+          begin
+            response = @client.pool.head(index_name)
+            return true
+          rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+            return false if e.response_code == 404
+            logger.warn("Error checking if index exists", :index => index_name, :error => e.message)
+            return false
+          rescue => e
+            logger.warn("Error checking if index exists", :index => index_name, :error => e.message)
+            return false
+          end
+        end        
+        # Create ILM policy (idempotent - only creates if missing)
+        def create_policy_if_missing(policy_name)
+          # Check if exists first
+          if @client.ilm_policy_exists?(policy_name)
+            logger.debug("Policy already exists", :policy => policy_name)
+            return
+          end
+          
+          # Create policy
+          policy_payload = build_dynamic_ilm_policy
+          @client.ilm_policy_put(policy_name, policy_payload)      
+          logger.info("Created ILM policy", :policy => policy_name)
+        end        
+        # Create template (idempotent - only creates if missing)
+        def create_template_if_missing(template_name, base_name, policy_name)
+          index_pattern = "#{base_name}-*"
+          
+          # All dynamic templates use priority 100 for simplicity
+          # Elasticsearch will match the most specific pattern automatically
+          priority = 100
+          
+          template = build_dynamic_template(index_pattern, policy_name, priority)
+          endpoint = TemplateManager.send(:template_endpoint, self)
+          
+          # template_install is idempotent (won't overwrite existing)
+          @client.template_install(endpoint, template_name, template, false)      
+          logger.info("Template ready", :template => template_name, :priority => priority)
+        end        
+        # Create first index with date-based naming (idempotent)
+        def create_index_if_missing(container_name, policy_name)
+          today = current_date_str
+          index_name = "#{container_name}-#{today}"
+          
+          # Check if today's index already exists
+          if index_exists?(index_name)
+            logger.debug("Index already exists for today", :index => index_name)
+            return index_name
+          end
+          
+          # Create today's index with ILM policy AND write alias
+          logger.info("Creating new index for container", 
+                      :container => container_name,
+                      :index => index_name,
+                      :policy => policy_name)
+          
+          # Configure both settings AND alias in a single request
+          index_payload = {
+            'settings' => {
+              'index' => {
+                'lifecycle' => {
+                  'name' => policy_name
                 },
-                "norms" => false,
-                "type" => "text"
+                'number_of_shards' => (@number_of_shards || 1).to_s,
+                'number_of_replicas' => (@number_of_replicas || 0).to_s
+              }
+            },
+            'aliases' => {
+              # Create write alias pointing to this index
+              # This allows events to be sent to "auto-uibackend" and be routed to the current day's index
+              container_name => {
+                'is_write_index' => true
               }
             }
           }
-        ],
-        "properties" => {
-          "@timestamp" => { "type" => "date" },
-          "@version" => { "type" => "keyword" },
-          "geoip" => {
-            "dynamic" => "true",
-            "properties" => {
-              "ip" => { "type" => "ip" },
-              "latitude" => { "type" => "half_float" },
-              "location" => { "type" => "geo_point" },
-              "longitude" => { "type" => "half_float" }
+          
+          begin
+            @client.pool.put(index_name, {}, LogStash::Json.dump(index_payload))
+            logger.info("Successfully created index with write alias", 
+                        :index => index_name,
+                        :alias => container_name,
+                        :container => container_name,
+                        :policy => policy_name)
+            return index_name
+          rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+            # 400 with "resource_already_exists_exception" means index was created by another thread - that's OK
+            if e.response_code == 400 && e.message.to_s.include?('resource_already_exists')
+              logger.debug("Index already created by another thread", :index => index_name)
+              return index_name
+            else
+              raise e
+            end
+          end        end
+        
+        # Build ILM policy payload based on configuration
+        def build_dynamic_ilm_policy
+          policy = {
+            "policy" => {
+              "phases" => {}
             }
           }
-        }
-      }
-        # Elasticsearch 8+ uses composable index templates
-      if es_major_version >= 8
-        {
-          "index_patterns" => [index_pattern],
-          "priority" => priority,
-          "template" => {
-            "settings" => base_settings,
-            "mappings" => common_mappings,
-            "aliases" => {}
-          },
-          "_meta" => {
-            "description" => "Dynamically created template for ILM-managed index",
-            "created_by" => "logstash-output-elasticsearch"
+          
+          # Hot phase configuration
+          hot_phase = {
+            "min_age" => "0ms",            "actions" => {}
           }
-        }
-      # Elasticsearch 7 uses legacy templates with flat structure
-      else
-        {
-          "index_patterns" => [index_pattern],
-          "order" => priority,
-          "settings" => base_settings,
-          "mappings" => common_mappings,
-          "aliases" => {},
-          "_meta" => {
-            "description" => "Dynamically created template for ILM-managed index",
-            "created_by" => "logstash-output-elasticsearch"          }
-        }
-      end
-    end
-    
-    # Helper to provide consistent date formatting for index names
-    def current_date_str
-      Time.now.strftime("%Y.%m.%d")
-    end
-    
+          
+          # Set priority
+          hot_phase["actions"]["set_priority"] = {
+            "priority" => @ilm_hot_priority
+          }
+          
+          policy["policy"]["phases"]["hot"] = hot_phase
+          
+          # Delete phase configuration (if enabled)
+          if @ilm_delete_enabled
+            delete_phase = {
+              "min_age" => @ilm_delete_min_age,
+              "actions" => {
+                "delete" => {
+                  "delete_searchable_snapshot" => true
+                }
+              }
+            }        
+            policy["policy"]["phases"]["delete"] = delete_phase
+          end
+          
+          policy
+        end
+        
+        # Build a template for dynamic ILM indices
+        def build_dynamic_template(index_pattern, policy_name, priority = 100)
+          logger.debug("Building dynamic template", 
+                       :index_pattern => index_pattern, 
+                       :policy_name => policy_name,
+                       :priority => priority)
+          
+          # Try to load a custom or default template if available
+          template = nil
+          begin            if @template
+              logger.debug("Loading custom template file", :template => @template)
+              template = TemplateManager.send(:read_template_file, @template)
+            else
+              logger.debug("Attempting to load default template", :es_version => maximum_seen_major_version, :ecs_compatibility => ecs_compatibility)
+              template = TemplateManager.send(:load_default_template, maximum_seen_major_version, ecs_compatibility)
+            end
+          rescue => e
+            logger.warn("Could not load template file - will create minimal template", :error => e.message)
+            template = nil
+          end
+          
+          # Use loaded template or create minimal one
+          if template && !template.empty?
+            # Modify loaded template with dynamic settings
+            template['index_patterns'] = [index_pattern]
+            template['priority'] = priority
+            
+            # Remove legacy template key if present
+            template.delete('template') if template.include?('template') && maximum_seen_major_version == 7
+            
+            # Add ILM settings
+            settings = TemplateManager.send(:resolve_template_settings, self, template)
+            settings.update({ 'index.lifecycle.name' => policy_name })
+          else
+            # Create minimal template programmatically
+            logger.info("Creating minimal dynamic template programmatically", 
+                        :index_pattern => index_pattern, 
+                        :policy_name => policy_name,
+                        :priority => priority)
+            template = create_minimal_template(index_pattern, policy_name, priority)          end      
+          
+          template
+        end
+        
+        # Create a minimal index template programmatically when template files are unavailable
+        def create_minimal_template(index_pattern, policy_name, priority = 100)
+          es_major_version = maximum_seen_major_version
+          
+          # Base settings with ILM configuration
+          base_settings = {
+            "index" => {
+              "lifecycle" => {
+                "name" => policy_name
+              },
+              "routing" => {
+                "allocation" => {
+                  "include" => {
+                    "_tier_preference" => "data_content"
+                  }
+                }
+              },
+              "refresh_interval" => "5s",
+              "number_of_shards" => (@number_of_shards || 1).to_s,
+              "number_of_replicas" => (@number_of_replicas || 0).to_s
+            }          }
+          
+          # Common mappings structure for both ES 7 and 8
+          common_mappings = {
+            "dynamic_templates" => [
+              {
+                "message_field" => {
+                  "path_match" => "message",
+                  "match_mapping_type" => "string",
+                  "mapping" => {
+                    "norms" => false,
+                    "type" => "text"
+                  }
+                }
+              },
+              {
+                "string_fields" => {
+                  "match" => "*",
+                  "match_mapping_type" => "string",
+                  "mapping" => {
+                    "fields" => {
+                      "keyword" => {
+                        "ignore_above" => 256,
+                        "type" => "keyword"
+                      }
+                    },
+                    "norms" => false,
+                    "type" => "text"
+                  }
+                }
+              }
+            ],
+            "properties" => {
+              "@timestamp" => { "type" => "date" },
+              "@version" => { "type" => "keyword" },
+              "geoip" => {
+                "dynamic" => "true",
+                "properties" => {
+                  "ip" => { "type" => "ip" },
+                  "latitude" => { "type" => "half_float" },
+                  "location" => { "type" => "geo_point" },
+                  "longitude" => { "type" => "half_float" }
+                }
+              }
+            }
+          }
+          
+          # Elasticsearch 8+ uses composable index templates
+          if es_major_version >= 8
+            {
+              "index_patterns" => [index_pattern],
+              "priority" => priority,
+              "template" => {
+                "settings" => base_settings,
+                "mappings" => common_mappings,
+                "aliases" => {}
+              },
+              "_meta" => {
+                "description" => "Dynamically created template for ILM-managed index",
+                "created_by" => "logstash-output-elasticsearch"
+              }
+            }
+          # Elasticsearch 7 uses legacy templates with flat structure
+          else
+            {
+              "index_patterns" => [index_pattern],
+              "order" => priority,
+              "settings" => base_settings,
+              "mappings" => common_mappings,
+              "aliases" => {},
+              "_meta" => {
+                "description" => "Dynamically created template for ILM-managed index",
+                "created_by" => "logstash-output-elasticsearch"
+              }
+            }
+          end
+        end
+        
+        # Helper to provide consistent date formatting for index names
+        def current_date_str
+          Time.now.strftime("%Y.%m.%d")
+        end
+        
       end
     end
   end
