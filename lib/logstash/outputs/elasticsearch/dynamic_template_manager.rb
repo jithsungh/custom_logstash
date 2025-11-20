@@ -6,82 +6,180 @@ module LogStash
         # Thread-safe cache to track which containers have been initialized
         def initialize_dynamic_template_cache
           @dynamic_templates_created ||= java.util.concurrent.ConcurrentHashMap.new
-        end
-          # Create ILM resources (policy, template, index) for a container
+          @write_alias_last_checked ||= java.util.concurrent.ConcurrentHashMap.new
+        end        
+        # Create ILM resources (policy, template, index) for a container
         # Called ONLY ONCE per container (first event), then cached
         def maybe_create_dynamic_template(index_name)
-      unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
+          unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
+            return
+          end
+          
+          # NOTE: index_name already has "auto-" prefix added by resolve_dynamic_rollover_alias
+          # in lib/logstash/outputs/elasticsearch.rb (line 656)
+          # So we use it directly without adding another prefix
+          container_name = index_name
+            # Fast path: If already created, skip entirely (no checks, no API calls)
+          current_value = @dynamic_templates_created.get(container_name)
+          if current_value == true
+            return
+          end
+          
+          # Build resource names early (needed for both success and error paths)
+          policy_name = "#{container_name}-ilm-policy"
+          template_name = "logstash-#{container_name}"
+          
+          # Thread-safe: Use putIfAbsent to ensure only ONE thread creates resources
+          # putIfAbsent returns nil if key was absent (we won the race), 
+          # or the previous value if key already existed (another thread has it)
+          previous_value = @dynamic_templates_created.putIfAbsent(container_name, "initializing")        
+          if previous_value.nil?
+            # We won the race! Key was absent, we now hold the lock with "initializing"
+            logger.info("Lock acquired, proceeding with initialization", :container => container_name)
+            # Continue to resource creation below
+          else
+            # Another thread already grabbed the lock (previous_value is "initializing" or true)
+            logger.debug("Another thread holds lock, waiting", 
+                         :container => container_name, 
+                         :lock_value => previous_value)
+            
+            # If it's already fully created, return immediately
+            return if previous_value == true
+            
+            # Otherwise wait for initialization to complete (another thread is working on it)
+            50.times do
+              sleep 0.1
+              current = @dynamic_templates_created.get(container_name)
+              if current == true
+                logger.debug("Initialization complete by other thread", :container => container_name)
+                return
+              end
+            end
+            
+            logger.error("Timeout waiting for ILM initialization - will retry", :container => container_name)
+            raise StandardError.new("Timeout waiting for container #{container_name} ILM initialization")
+          end
+          
+          logger.info("Initializing ILM resources for new container", :container => container_name)
+          
+          # Create resources in order: policy → template → index
+          # Each method is idempotent (safe to call multiple times)
+          create_policy_if_missing(policy_name)
+          create_template_if_missing(template_name, container_name, policy_name)
+          create_index_if_missing(container_name, policy_name)
+          
+          # Ensure write alias points to today's index (handles daily rollover)
+          ensure_write_alias_current(container_name, policy_name)
+          
+          # Mark as successfully created
+          @dynamic_templates_created.put(container_name, true)
+            logger.info("ILM resources ready, lock released", 
+                      :container => container_name,
+                      :policy => policy_name,
+                      :template => template_name,
+                      :index_pattern => "#{container_name}-*")
+        rescue => e
+          # Don't cache on failure - will retry on next event
+          @dynamic_templates_created.remove(container_name)
+          logger.error("Failed to initialize ILM resources - will retry on next event", 
+                       :container => container_name, 
+                       :error => e.message,
+                       :backtrace => e.backtrace.first(3))
+        end
+        
+        # Ensure the write alias points to today's index
+        # This handles daily rollover automatically
+        def ensure_write_alias_current(container_name, policy_name)
+      today = current_date_str
+      today_index = "#{container_name}-#{today}"
+      
+      # Check if we've already verified this today (cache key includes date)
+      cache_key = "#{container_name}:#{today}"
+      if @write_alias_last_checked.get(cache_key)
+        return # Already checked today
+      end
+      
+      # If today's index doesn't exist, create it
+      unless index_exists?(today_index)
+        create_index_if_missing(container_name, policy_name)
+        @write_alias_last_checked.put(cache_key, true)
         return
       end
-        # NOTE: index_name already has "auto-" prefix added by resolve_dynamic_rollover_alias
-      # in lib/logstash/outputs/elasticsearch.rb (line 656)
-      # So we use it directly without adding another prefix
-      container_name = index_name
       
-      # Fast path: If already created, skip entirely (no checks, no API calls)
-      current_value = @dynamic_templates_created.get(container_name)
-      if current_value == true
-        return
-      end
-      
-      # Build resource names early (needed for both success and error paths)
-      policy_name = "#{container_name}-ilm-policy"
-      template_name = "logstash-#{container_name}"
-      
-      # Thread-safe: Use putIfAbsent to ensure only ONE thread creates resources
-      # putIfAbsent returns nil if key was absent (we won the race), 
-      # or the previous value if key already existed (another thread has it)
-      previous_value = @dynamic_templates_created.putIfAbsent(container_name, "initializing")        
-      if previous_value.nil?
-        # We won the race! Key was absent, we now hold the lock with "initializing"
-        logger.info("Lock acquired, proceeding with initialization", :container => container_name)
-        # Continue to resource creation below
-      else
-        # Another thread already grabbed the lock (previous_value is "initializing" or true)
-        logger.debug("Another thread holds lock, waiting", 
-                     :container => container_name, 
-                     :lock_value => previous_value)
+      # Check if the write alias is already pointing to today's index
+      begin
+        response = @client.pool.get("_alias/#{container_name}")
+        response_body = LogStash::Json.load(response.body)
         
-        # If it's already fully created, return immediately
-        return if previous_value == true
-        
-        # Otherwise wait for initialization to complete (another thread is working on it)
-        50.times do
-          sleep 0.1
-          current = @dynamic_templates_created.get(container_name)
-          if current == true
-            logger.debug("Initialization complete by other thread", :container => container_name)
+        # Find which index has the write alias
+        response_body.each do |index_name, data|
+          aliases = data['aliases'] || {}
+          if aliases[container_name] && aliases[container_name]['is_write_index']
+            # If write alias already points to today's index, we're done
+            if index_name == today_index
+              @write_alias_last_checked.put(cache_key, true)
+              return
+            end
+            
+            # Otherwise, we need to move the write alias to today's index
+            logger.info("Moving write alias to today's index",
+                       :alias => container_name,
+                       :from => index_name,
+                       :to => today_index)
+            
+            # Move the write alias atomically
+            update_write_alias(container_name, today_index)
+            @write_alias_last_checked.put(cache_key, true)
             return
           end
         end
         
-        logger.error("Timeout waiting for ILM initialization - will retry", :container => container_name)
-        raise StandardError.new("Timeout waiting for container #{container_name} ILM initialization")
+        # No write alias found - create it on today's index
+        logger.info("No write alias found, creating on today's index",
+                   :alias => container_name,
+                   :index => today_index)
+        update_write_alias(container_name, today_index)
+        @write_alias_last_checked.put(cache_key, true)
+        
+      rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+        if e.response_code == 404
+          # Alias doesn't exist - create it
+          logger.info("Alias not found, creating on today's index",
+                     :alias => container_name,
+                     :index => today_index)
+          update_write_alias(container_name, today_index)
+          @write_alias_last_checked.put(cache_key, true)
+        else
+          logger.warn("Error checking write alias", 
+                     :alias => container_name,
+                     :error => e.message)
+        end
       end
-      
-      logger.info("Initializing ILM resources for new container", :container => container_name)
-      
-      # Create resources in order: policy → template → index
-      # Each method is idempotent (safe to call multiple times)
-      create_policy_if_missing(policy_name)
-      create_template_if_missing(template_name, container_name, policy_name)
-      create_index_if_missing(container_name, policy_name)
-      
-      # Mark as successfully created
-      @dynamic_templates_created.put(container_name, true)
-      
-      logger.info("ILM resources ready, lock released", 
-                  :container => container_name,
-                  :policy => policy_name,
-                  :template => template_name,
-                  :index_pattern => "#{container_name}-*")
-    rescue => e
-      # Don't cache on failure - will retry on next event
-      @dynamic_templates_created.remove(container_name)
-      logger.error("Failed to initialize ILM resources - will retry on next event", 
-                   :container => container_name, 
-                   :error => e.message,                   :backtrace => e.backtrace.first(3))
     end
+    
+    # Update the write alias to point to a specific index
+    def update_write_alias(alias_name, target_index)
+      payload = {
+        'actions' => [
+          {
+            'add' => {
+              'index' => target_index,
+              'alias' => alias_name,
+              'is_write_index' => true
+            }
+          }
+        ]
+      }
+      
+      @client.pool.post('_aliases', {}, LogStash::Json.dump(payload))
+      logger.info("Updated write alias", :alias => alias_name, :index => target_index)
+    rescue => e
+      logger.error("Failed to update write alias",
+                  :alias => alias_name,
+                  :index => target_index,
+                  :error => e.message)
+    end
+      
       # Handle indexing errors - recreate if index is missing
     def handle_dynamic_ilm_error(container_name, error)
       return unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
@@ -160,8 +258,7 @@ module LogStash
       # template_install is idempotent (won't overwrite existing)
       @client.template_install(endpoint, template_name, template, false)      
       logger.info("Template ready", :template => template_name, :priority => priority)
-    end    
-    # Create first index with date-based naming (idempotent)
+    end      # Create first index with date-based naming (idempotent)
     def create_index_if_missing(container_name, policy_name)
       today = current_date_str
       index_name = "#{container_name}-#{today}"
@@ -169,15 +266,16 @@ module LogStash
       # Check if today's index already exists
       if index_exists?(index_name)
         logger.debug("Index already exists for today", :index => index_name)
-        return
+        return index_name
       end
       
-      # Create today's index with ILM policy
+      # Create today's index with ILM policy AND write alias
       logger.info("Creating new index for container", 
                   :container => container_name,
                   :index => index_name,
                   :policy => policy_name)
       
+      # Configure both settings AND alias in a single request
       index_payload = {
         'settings' => {
           'index' => {
@@ -187,20 +285,31 @@ module LogStash
             'number_of_shards' => (@number_of_shards || 1).to_s,
             'number_of_replicas' => (@number_of_replicas || 0).to_s
           }
+        },
+        'aliases' => {
+          # Create write alias pointing to this index
+          # This allows events to be sent to "auto-uibackend" and be routed to the current day's index
+          container_name => {
+            'is_write_index' => true
+          }
         }
       }
       
       begin
         @client.pool.put(index_name, {}, LogStash::Json.dump(index_payload))
-        logger.info("Successfully created index", 
+        logger.info("Successfully created index with write alias", 
                     :index => index_name,
+                    :alias => container_name,
                     :container => container_name,
                     :policy => policy_name)
+        return index_name
       rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
         # 400 with "resource_already_exists_exception" means index was created by another thread - that's OK
         if e.response_code == 400 && e.message.to_s.include?('resource_already_exists')
           logger.debug("Index already created by another thread", :index => index_name)
-        else          raise e
+          return index_name
+        else
+          raise e
         end
       end
     end
