@@ -415,7 +415,6 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
     end
     @document_level_metrics.increment(:non_retryable_failures, event_mapping_errors.size)
   end
-
   MapEventsResult = Struct.new(:successful_events, :event_mapping_errors)
   FailedEventMapping = Struct.new(:event, :message)
   
@@ -440,6 +439,18 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
           params = event_action[1]
           index_name = params[:_index] if params
           
+          # Validate container_name was resolved (no remaining placeholders)
+          if index_name && index_name.include?('%{')
+            # Field missing or not resolved - log and skip dynamic template creation
+            container_field = extract_field_from_sprintf(@ilm_rollover_alias)
+            logger.warn("Container field not found in event, using fallback index", 
+                        :field => container_field,
+                        :template => @ilm_rollover_alias,
+                        :event_fields => event.to_hash.keys.take(10))
+            # Skip dynamic template creation for this event
+            next
+          end
+          
           # Skip if we've already processed this container in this batch
           if index_name && !batch_processed_containers.include?(index_name)
             batch_processed_containers.add(index_name)
@@ -448,9 +459,21 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
         end
       rescue EventMappingError => ie
         event_mapping_errors << FailedEventMapping.new(event, ie.message)
+      rescue => e
+        # Catch any unexpected errors during dynamic template creation
+        logger.error("Unexpected error during event mapping", 
+                     :error => e.message,
+                     :backtrace => e.backtrace.first(3))
+        event_mapping_errors << FailedEventMapping.new(event, "Unexpected error: #{e.message}")
       end
     end
     MapEventsResult.new(successful_events, event_mapping_errors)
+  end
+  
+  # Extract field name from sprintf template
+  def extract_field_from_sprintf(template)
+    match = template.match(/%\{(\[?[^\}]+\]?)\}/)
+    match ? match[1] : nil
   end
 
   public
@@ -634,8 +657,7 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
     pipeline_template = @pipeline || event.get("[@metadata][target_ingest_pipeline]")&.to_s
     pipeline_template && event.sprintf(pipeline_template)
   end    
-  
-  def resolve_dynamic_rollover_alias(event)
+    def resolve_dynamic_rollover_alias(event)
     return nil unless ilm_in_use? && @ilm_rollover_alias_template
     
     # Perform sprintf substitution on the rollover alias template
@@ -643,13 +665,28 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
     
     # Validate that substitution actually happened (check for remaining placeholders)
     if resolved_alias.include?('%{')
-      logger.warn("Field not found in event for ILM rollover alias - using default", 
+      logger.debug("Field not found in event for ILM rollover alias - fallback to default", 
                   :template => @ilm_rollover_alias_template,
                   :resolved => resolved_alias,
                   :available_fields => event.to_hash.keys.take(10))
       
       # Fallback to default alias to avoid creating invalid index names
       resolved_alias = @default_ilm_rollover_alias
+    else
+      # Validate the resolved alias name follows Elasticsearch naming rules
+      # Index names must be lowercase and cannot contain: \, /, *, ?, ", <, >, |, ` ` (space), ,, #
+      invalid_chars = /[\\\/*?"<>|,# ]/
+      if resolved_alias =~ invalid_chars
+        logger.warn("Invalid characters in resolved alias name - using sanitized version", 
+                    :original => resolved_alias,
+                    :invalid_chars => resolved_alias.scan(invalid_chars).uniq.join(', '))
+        
+        # Sanitize: remove invalid chars and convert to lowercase
+        resolved_alias = resolved_alias.gsub(invalid_chars, '-').downcase
+      else
+        # Ensure lowercase
+        resolved_alias = resolved_alias.downcase
+      end
     end
     
     # IMPORTANT: Add "auto-" prefix to match the alias created by maybe_create_dynamic_template
@@ -659,7 +696,7 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
     # NOTE: We don't call ensure_rollover_alias_exists here anymore
     # That's handled by maybe_create_dynamic_template in safe_interpolation_map_events
     # This avoids duplicate calls for every event
-      resolved_alias
+    resolved_alias
   end
   private :resolve_dynamic_rollover_alias
 

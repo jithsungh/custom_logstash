@@ -2,21 +2,30 @@ module LogStash
   module Outputs
     class ElasticSearch
       module DynamicTemplateManager
-    
-    # Thread-safe cache to track which containers have been initialized
+      # Thread-safe cache to track which containers have been initialized
     def initialize_dynamic_template_cache
       @dynamic_templates_created ||= java.util.concurrent.ConcurrentHashMap.new
       # Cache last checked day per alias to avoid repeated rollover checks
       @alias_rollover_checked_date ||= java.util.concurrent.ConcurrentHashMap.new
       # Cache resource existence to avoid redundant API calls
       @resource_exists_cache ||= java.util.concurrent.ConcurrentHashMap.new
+      # Track initialization attempts to detect anomalies
+      @initialization_attempts ||= java.util.concurrent.ConcurrentHashMap.new
       
-    end
-          # SIMPLIFIED: Create ILM resources (policy, template, index) for a container
+      logger.debug("Initialized dynamic template caches")
+    end          # SIMPLIFIED: Create ILM resources (policy, template, index) for a container
         # Called ONLY ONCE per container (first event), then cached
         # Auto-recovers ONLY on index-related errors (not policy/template errors)
         def maybe_create_dynamic_template(index_name)
       unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
+        return
+      end
+      
+      # Validate index name follows Elasticsearch naming rules
+      unless valid_index_name?(index_name)
+        logger.error("Invalid index name detected - skipping dynamic template creation", 
+                     :index_name => index_name,
+                     :reason => "Contains invalid characters or format")
         return
       end
       
@@ -32,6 +41,9 @@ module LogStash
         maybe_rollover_for_new_day(alias_name)
         return
       end
+      
+      # Anomaly detection: Check if this container is stuck in initialization loop
+      detect_initialization_anomaly(alias_name)
         # THREAD-SAFE: Use putIfAbsent to ensure only ONE thread creates resources
       # putIfAbsent returns nil if key was absent (we won the race), 
       # or the previous value if key already existed (another thread has it)
@@ -68,11 +80,19 @@ module LogStash
       policy_name = "#{alias_name}-ilm-policy"
       template_name = "logstash-#{alias_name}"
       
+      # Validate resource names before proceeding
+      validate_resource_names(alias_name, policy_name, template_name)
+      
       # Create resources in order: policy → template → index
       # Each method is idempotent (safe to call multiple times)
       create_policy_if_missing(policy_name)
       create_template_if_missing(template_name, alias_name, policy_name)
-      create_index_if_missing(alias_name, policy_name)      # Mark as successfully created
+      create_index_if_missing(alias_name, policy_name)
+      
+      # Verify resources were actually created
+      verify_resources_created(alias_name, policy_name, template_name)
+      
+      # Mark as successfully created
       @dynamic_templates_created.put(alias_name, true)
       
       logger.info("ILM resources ready, lock released", 
@@ -87,7 +107,7 @@ module LogStash
                    :container => alias_name, 
                    :error => e.message,
                    :backtrace => e.backtrace.first(3))
-    end      
+    end
     # Handle indexing errors - ONLY recreate if index is missing
     # This is called by the bulk indexer when an error occurs
     def handle_dynamic_ilm_error(alias_name, error)
@@ -147,28 +167,67 @@ module LogStash
         logger.debug("Error checking alias existence", :alias => alias_name, :error => e.message)
         false
       end
-    end
-      # Create ILM policy (idempotent - only creates if missing)
+    end      # Create ILM policy (idempotent - only creates if missing)
     def create_policy_if_missing(policy_name)
       # Check cache first to avoid API call
       cache_key = "policy:#{policy_name}"
       return if @resource_exists_cache.get(cache_key) == true
       
-      # Check if exists in Elasticsearch
-      if @client.ilm_policy_exists?(policy_name)
-        logger.debug("Policy already exists", :policy => policy_name)
+      max_retries = 3
+      retry_count = 0
+      
+      begin
+        # Check if exists in Elasticsearch
+        if @client.ilm_policy_exists?(policy_name)
+          logger.debug("Policy already exists", :policy => policy_name)
+          @resource_exists_cache.put(cache_key, true)
+          return
+        end
+        
+        # Create policy
+        policy_payload = build_dynamic_ilm_policy
+        
+        # Validate policy payload before sending
+        validate_ilm_policy(policy_payload, policy_name)
+        
+        @client.ilm_policy_put(policy_name, policy_payload)
         @resource_exists_cache.put(cache_key, true)
-        return
+        
+        logger.info("Created ILM policy", :policy => policy_name)
+      rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+        if e.response_code == 400
+          # Policy might have been created by another thread/instance - check again
+          if @client.ilm_policy_exists?(policy_name)
+            logger.info("Policy exists (created concurrently)", :policy => policy_name)
+            @resource_exists_cache.put(cache_key, true)
+            return
+          end
+          
+          logger.error("Invalid policy payload", 
+                       :policy => policy_name,
+                       :response_code => e.response_code,
+                       :response_body => e.response_body)
+          raise e
+        elsif e.response_code == 429 && retry_count < max_retries
+          # Rate limited - retry with exponential backoff
+          retry_count += 1
+          sleep_time = [2 ** retry_count, 10].min
+          logger.warn("Rate limited creating policy, retrying", 
+                      :policy => policy_name,
+                      :retry => retry_count,
+                      :sleep => sleep_time)
+          sleep sleep_time
+          retry
+        else
+          raise e
+        end
+      rescue => e
+        logger.error("Unexpected error creating policy", 
+                     :policy => policy_name,
+                     :error => e.message)
+        raise e
       end
-      
-      # Create policy
-      policy_payload = build_dynamic_ilm_policy
-      @client.ilm_policy_put(policy_name, policy_payload)
-      @resource_exists_cache.put(cache_key, true)
-      
-      logger.info("Created ILM policy", :policy => policy_name)
-    end      
-    
+    end    
     # Create template (idempotent - only creates if missing)
     def create_template_if_missing(template_name, base_name, policy_name)
       index_pattern = "#{base_name}-*"
@@ -184,17 +243,54 @@ module LogStash
         return
       end
       
-      template = build_dynamic_template(index_pattern, policy_name, priority)
-      endpoint = TemplateManager.send(:template_endpoint, self)
+      max_retries = 3
+      retry_count = 0
       
-      # template_install is idempotent (won't overwrite existing)
-      @client.template_install(endpoint, template_name, template, false)
-      @resource_exists_cache.put(cache_key, true)
-      
-      logger.info("Template ready", :template => template_name, :priority => priority)
+      begin
+        template = build_dynamic_template(index_pattern, policy_name, priority)
+        endpoint = TemplateManager.send(:template_endpoint, self)
+        
+        # template_install is idempotent (won't overwrite existing)
+        @client.template_install(endpoint, template_name, template, false)
+        @resource_exists_cache.put(cache_key, true)
+        
+        logger.info("Template ready", :template => template_name, :priority => priority)
+      rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+        if e.response_code == 400
+          # Template might exist - check
+          endpoint = TemplateManager.send(:template_endpoint, self)
+          existing = @client.get_template(endpoint, template_name)
+          if existing && !existing.empty?
+            logger.info("Template exists (created concurrently)", :template => template_name)
+            @resource_exists_cache.put(cache_key, true)
+            return
+          end
+          
+          logger.error("Invalid template payload", 
+                       :template => template_name,
+                       :response_code => e.response_code,
+                       :response_body => e.response_body)
+          raise e
+        elsif e.response_code == 429 && retry_count < max_retries
+          retry_count += 1
+          sleep_time = [2 ** retry_count, 10].min
+          logger.warn("Rate limited creating template, retrying", 
+                      :template => template_name,
+                      :retry => retry_count,
+                      :sleep => sleep_time)
+          sleep sleep_time
+          retry
+        else
+          raise e
+        end
+      rescue => e
+        logger.error("Unexpected error creating template", 
+                     :template => template_name,
+                     :error => e.message)
+        raise e
+      end
     end
-    
-    # Create first index with write alias (idempotent - only creates if missing)
+      # Create first index with write alias (idempotent - only creates if missing)
     def create_index_if_missing(alias_name, policy_name)
       # DEFENSIVE: Loop to handle auto-creation race conditions
       max_attempts = 3
@@ -255,6 +351,12 @@ module LogStash
       today = current_date_str
       first_index_name = "#{alias_name}-#{today}-000001"
       
+      # Validate index name before creating
+      unless valid_index_name?(first_index_name)
+        logger.error("Generated index name is invalid", :index => first_index_name)
+        raise LogStash::ConfigurationError, "Invalid index name: #{first_index_name}"
+      end
+      
       index_payload = {
         'aliases' => {
           alias_name => {
@@ -270,18 +372,35 @@ module LogStash
           }
         }
       }
-        @client.rollover_alias_put(first_index_name, index_payload)
       
-      # Verify the alias was created correctly (not as a simple index)
-      if @client.rollover_alias_exists?(alias_name)
-        logger.info("Created and verified rollover index", 
-                    :index => first_index_name, 
-                    :alias => alias_name,
-                    :policy => policy_name)
-      else
-        logger.error("Rollover index creation may have failed - alias not found after creation", 
+      begin
+        @client.rollover_alias_put(first_index_name, index_payload)
+        
+        # Verify the alias was created correctly (not as a simple index)
+        if @client.rollover_alias_exists?(alias_name)
+          logger.info("Created and verified rollover index", 
+                      :index => first_index_name, 
+                      :alias => alias_name,
+                      :policy => policy_name)
+        else
+          logger.error("Rollover index creation may have failed - alias not found after creation", 
+                       :index => first_index_name,
+                       :alias => alias_name)
+        end
+      rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+        if e.response_code == 400
+          # Check if it was created by another thread/instance
+          if @client.rollover_alias_exists?(alias_name)
+            logger.info("Index exists (created concurrently)", :alias => alias_name)
+            return
+          end
+        end
+        
+        logger.error("Failed to create rollover index", 
                      :index => first_index_name,
-                     :alias => alias_name)
+                     :response_code => e.response_code,
+                     :response_body => e.response_body)
+        raise e
       end
     end
     
@@ -688,8 +807,7 @@ module LogStash
       Time.now.strftime("%Y.%m.%d")
     end
       end
-    end
-    
+    end    
     # UTILITY: Clear all caches for a specific container (useful for manual intervention or testing)
     # Can be called if you manually delete resources in Elasticsearch
     def clear_container_cache(alias_name)
@@ -698,6 +816,162 @@ module LogStash
       @alias_rollover_checked_date.remove(alias_name)
       @resource_exists_cache.remove("policy:#{alias_name}-ilm-policy")
       @resource_exists_cache.remove("template:logstash-#{alias_name}")
+      @initialization_attempts.remove(alias_name)
+    end
+    
+    # Validate that index name follows Elasticsearch naming rules
+    def valid_index_name?(name)
+      return false if name.nil? || name.empty?
+      
+      # Index names must be lowercase
+      return false if name != name.downcase
+      
+      # Cannot contain: \, /, *, ?, ", <, >, |, ` ` (space), ,, #
+      return false if name =~ /[\\\/*?"<>|,# ]/
+      
+      # Cannot start with -, _, +
+      return false if name =~ /^[-_+]/
+      
+      # Cannot be . or ..
+      return false if name == '.' || name == '..'
+      
+      # Length must be <= 255 bytes
+      return false if name.bytesize > 255
+      
+      true
+    end
+    
+    # Validate all resource names before creating them
+    def validate_resource_names(alias_name, policy_name, template_name)
+      unless valid_index_name?(alias_name)
+        raise LogStash::ConfigurationError, "Invalid alias name: #{alias_name}"
+      end
+      
+      # Policy and template names have similar but slightly different rules
+      # For simplicity, we use the same validation
+      unless valid_index_name?(policy_name)
+        raise LogStash::ConfigurationError, "Invalid policy name: #{policy_name}"
+      end
+      
+      unless valid_index_name?(template_name)
+        raise LogStash::ConfigurationError, "Invalid template name: #{template_name}"
+      end
+      
+      logger.debug("Resource names validated", 
+                   :alias => alias_name,
+                   :policy => policy_name,
+                   :template => template_name)
+    end
+    
+    # Detect if a container is stuck in an initialization loop (anomaly detection)
+    def detect_initialization_anomaly(alias_name)
+      attempts = @initialization_attempts.get(alias_name) || 0
+      
+      if attempts > 10
+        logger.error("ANOMALY DETECTED: Container initialization failed repeatedly", 
+                     :alias => alias_name,
+                     :attempts => attempts,
+                     :action => "Clearing cache to force full retry")
+        
+        # Clear all caches to force a fresh start
+        clear_container_cache(alias_name)
+        @initialization_attempts.put(alias_name, 0)
+      elsif attempts > 5
+        logger.warn("Container initialization retrying multiple times", 
+                    :alias => alias_name,
+                    :attempts => attempts)
+      end
+      
+      # Increment attempt counter
+      @initialization_attempts.put(alias_name, attempts + 1)
+    end
+    
+    # Verify that all resources were actually created successfully
+    def verify_resources_created(alias_name, policy_name, template_name)
+      # Verify policy exists
+      unless @client.ilm_policy_exists?(policy_name)
+        logger.error("VERIFICATION FAILED: Policy does not exist after creation", 
+                     :policy => policy_name)
+        raise StandardError.new("Policy verification failed: #{policy_name}")
+      end
+      
+      # Verify template exists
+      endpoint = TemplateManager.send(:template_endpoint, self)
+      template_exists = begin
+        templates = @client.get_template(endpoint, template_name)
+        !templates.nil? && !templates.empty?
+      rescue => e
+        logger.warn("Error verifying template", :template => template_name, :error => e.message)
+        false
+      end
+      
+      unless template_exists
+        logger.error("VERIFICATION FAILED: Template does not exist after creation", 
+                     :template => template_name)
+        raise StandardError.new("Template verification failed: #{template_name}")
+      end
+      
+      # Verify alias/index exists
+      unless @client.rollover_alias_exists?(alias_name)
+        logger.error("VERIFICATION FAILED: Alias does not exist after creation", 
+                     :alias => alias_name)
+        raise StandardError.new("Alias verification failed: #{alias_name}")
+      end
+      
+      logger.debug("All resources verified successfully", 
+                   :alias => alias_name,
+                   :policy => policy_name,
+                   :template => template_name)
+        # Reset attempt counter on success
+      @initialization_attempts.put(alias_name, 0)
+    end
+    
+    # Validate ILM policy structure before sending to Elasticsearch
+    def validate_ilm_policy(policy, policy_name)
+      unless policy && policy['policy'] && policy['policy']['phases']
+        raise LogStash::ConfigurationError, "Invalid ILM policy structure for #{policy_name}"
+      end
+      
+      phases = policy['policy']['phases']
+      
+      # Validate hot phase if present
+      if phases['hot']
+        hot = phases['hot']
+        if hot['actions'] && hot['actions']['rollover']
+          rollover = hot['actions']['rollover']
+          
+          # At least one rollover condition must be present
+          if rollover.empty?
+            raise LogStash::ConfigurationError, "Hot phase rollover action must have at least one condition"
+          end
+          
+          # Validate max_age format
+          if rollover['max_age'] && rollover['max_age'] !~ /^\d+[dhms]$/
+            logger.warn("Invalid max_age format in ILM policy", 
+                        :policy => policy_name,
+                        :max_age => rollover['max_age'])
+          end
+          
+          # Validate max_size format
+          if rollover['max_size'] && rollover['max_size'] !~ /^\d+[kmgt]b$/i
+            logger.warn("Invalid max_size format in ILM policy", 
+                        :policy => policy_name,
+                        :max_size => rollover['max_size'])
+          end
+        end
+      end
+      
+      # Validate delete phase if present
+      if phases['delete']
+        delete = phases['delete']
+        if delete['min_age'] && delete['min_age'] !~ /^\d+[dhms]$/
+          logger.warn("Invalid min_age format in delete phase", 
+                      :policy => policy_name,
+                      :min_age => delete['min_age'])
+        end
+      end
+      
+      logger.debug("ILM policy validation passed", :policy => policy_name)
     end
     
     private
