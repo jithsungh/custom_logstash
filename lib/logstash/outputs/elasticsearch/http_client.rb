@@ -502,9 +502,7 @@ module LogStash; module Outputs; class ElasticSearch;
       # Other errors should be raised
       logger.error("Error checking if rollover alias exists", :alias => name, :response_code => e.response_code, :error => e.message)
       raise e
-    end
-      # Create a new rollover alias with initial index
-    # This uses a bootstrap index creation approach that works around date math URL encoding issues
+    end    # Create a new rollover alias with initial index
     def rollover_alias_put(index_pattern, alias_definition)
       # Extract the alias name from the definition
       alias_name = alias_definition['aliases'].keys.first
@@ -529,7 +527,8 @@ module LogStash; module Outputs; class ElasticSearch;
                   :index => first_index_name,
                   :alias => alias_name,
                   :payload_size => index_payload_json.bytesize)
-        # Create the index with the alias
+      
+      # Create the index with the alias
       @pool.put(first_index_name, nil, index_payload_json)
       
       logger.info("Created rollover index", 
@@ -543,22 +542,9 @@ module LogStash; module Outputs; class ElasticSearch;
           # Index already exists - this is OK, just means another thread created it first
           logger.debug("Index already exists, proceeding", :index => first_index_name)
           return
-        elsif response_body.include?("invalid_alias_name_exception") && 
-              response_body.include?("an index or data stream exists with the same name as the alias")
-          # This should have been caught earlier by simple_index_exists? check
-          # but if we still hit it, provide a clear error
-          logger.error("FATAL: Index exists with same name as alias", 
-                      :alias => alias_name,
-                      :problem => "An index named '#{alias_name}' exists. This should have been auto-deleted.",
-                      :suggestion => "Try again - the next attempt should auto-clean it.")
-          raise StandardError.new("Cannot create alias '#{alias_name}': conflicting index exists")
-        else
-          logger.warn("Rollover index creation returned 400", 
-                      :index => first_index_name,
-                      :response_body => response_body)
-          return
         end
       end
+      
       logger.error("Rollover index creation failed", 
                    :index => first_index_name,
                    :response_code => e.response_code,

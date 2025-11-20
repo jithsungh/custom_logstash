@@ -6,13 +6,9 @@ module LogStash
         # Thread-safe cache to track which containers have been initialized
         def initialize_dynamic_template_cache
           @dynamic_templates_created ||= java.util.concurrent.ConcurrentHashMap.new
-          # Cache last checked day per alias to avoid repeated rollover checks
-          @alias_rollover_checked_date ||= java.util.concurrent.ConcurrentHashMap.new
         end
-        
-        # SIMPLIFIED: Create ILM resources (policy, template, index) for a container
+          # Create ILM resources (policy, template, index) for a container
         # Called ONLY ONCE per container (first event), then cached
-        # Auto-recovers ONLY on index-related errors (not policy/template errors)
         def maybe_create_dynamic_template(index_name)
       unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
         return
@@ -20,26 +16,26 @@ module LogStash
       
       # NOTE: index_name already has "auto-" prefix added by resolve_dynamic_rollover_alias
       # in lib/logstash/outputs/elasticsearch.rb (line 656)
-      # So we use it directly without adding another prefix
-      alias_name = index_name
+      # So we use it directly without adding another prefix      container_name = index_name
       
-      # FAST PATH: If already created, skip entirely (no checks, no API calls)
-      current_value = @dynamic_templates_created.get(alias_name)
+      # Fast path: If already created, skip entirely (no checks, no API calls)
+      current_value = @dynamic_templates_created.get(container_name)
       if current_value == true
         return
       end
-        # THREAD-SAFE: Use putIfAbsent to ensure only ONE thread creates resources
+      
+      # Thread-safe: Use putIfAbsent to ensure only ONE thread creates resources
       # putIfAbsent returns nil if key was absent (we won the race), 
       # or the previous value if key already existed (another thread has it)
-      previous_value = @dynamic_templates_created.putIfAbsent(alias_name, "initializing")
+      previous_value = @dynamic_templates_created.putIfAbsent(container_name, "initializing")
         if previous_value.nil?
         # We won the race! Key was absent, we now hold the lock with "initializing"
-        logger.info("Lock acquired, proceeding with initialization", :container => alias_name)
+        logger.info("Lock acquired, proceeding with initialization", :container => container_name)
         # Continue to resource creation below
       else
         # Another thread already grabbed the lock (previous_value is "initializing" or true)
         logger.debug("Another thread holds lock, waiting", 
-                     :container => alias_name, 
+                     :container => container_name, 
                      :lock_value => previous_value)
         
         # If it's already fully created, return immediately
@@ -47,95 +43,91 @@ module LogStash
           # Otherwise wait for initialization to complete (another thread is working on it)
         50.times do
           sleep 0.1
-          current = @dynamic_templates_created.get(alias_name)
+          current = @dynamic_templates_created.get(container_name)
           if current == true
-            logger.debug("Initialization complete by other thread", :container => alias_name)
+            logger.debug("Initialization complete by other thread", :container => container_name)
             return
           end
         end
         
-        logger.error("Timeout waiting for ILM initialization - will retry", :container => alias_name)
-        raise StandardError.new("Timeout waiting for container #{alias_name} ILM initialization")
+        logger.error("Timeout waiting for ILM initialization - will retry", :container => container_name)
+        raise StandardError.new("Timeout waiting for container #{container_name} ILM initialization")
       end
       
-      logger.info("Initializing ILM resources for new container", :container => alias_name)
+      logger.info("Initializing ILM resources for new container", :container => container_name)
       
       # Build resource names
-      policy_name = "#{alias_name}-ilm-policy"
-      template_name = "logstash-#{alias_name}"
+      policy_name = "#{container_name}-ilm-policy"
+      template_name = "logstash-#{container_name}"
       
       # Create resources in order: policy → template → index
       # Each method is idempotent (safe to call multiple times)
       create_policy_if_missing(policy_name)
-      create_template_if_missing(template_name, alias_name, policy_name)
-      create_index_if_missing(alias_name, policy_name)      # Mark as successfully created
-      @dynamic_templates_created.put(alias_name, true)
+      create_template_if_missing(template_name, container_name, policy_name)
+      create_index_if_missing(container_name, policy_name)
+      
+      # Mark as successfully created
+      @dynamic_templates_created.put(container_name, true)
       
       logger.info("ILM resources ready, lock released", 
-                  :container => alias_name,
+                  :container => container_name,
                   :policy => policy_name,
                   :template => template_name,
-                  :alias => alias_name)
+                  :index_pattern => "#{container_name}-*")
     rescue => e
       # Don't cache on failure - will retry on next event
-      @dynamic_templates_created.remove(alias_name)
+      @dynamic_templates_created.remove(container_name)
       logger.error("Failed to initialize ILM resources - will retry on next event", 
-                   :container => alias_name, 
-                   :error => e.message,
-                   :backtrace => e.backtrace.first(3))
+                   :container => container_name, 
+                   :error => e.message,                   :backtrace => e.backtrace.first(3))
     end
-      # Handle indexing errors - ONLY recreate if index is missing
-    # This is called by the bulk indexer when an error occurs
-    def handle_dynamic_ilm_error(alias_name, error)
+      # Handle indexing errors - recreate if index is missing
+    def handle_dynamic_ilm_error(container_name, error)
       return unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
       
       error_message = error.message.to_s.downcase
       
-      # ONLY handle index-related errors (not policy/template errors)
-      # Elasticsearch errors for missing index:
-      # - "index_not_found_exception"
-      # - "no such index"
-      # - "IndexNotFoundException"
+      # Handle index-related errors only
       index_missing = error_message.include?('index_not_found') ||
                       error_message.include?('no such index') ||
                       error_message.include?('indexnotfound')
       
       if index_missing
         logger.warn("Index missing, recreating", 
-                    :container => alias_name,
+                    :container => container_name,
                     :error => error.message)
         
         # Clear cache and recreate
-        @dynamic_templates_created.remove(alias_name)
-        maybe_create_dynamic_template(alias_name)
+        @dynamic_templates_created.remove(container_name)
+        maybe_create_dynamic_template(container_name)
       end
-    end
-    
+    end    
     # Called from common.rb when bulk indexing encounters index_not_found error
-    # Extracts the index name from the action and clears the cache
     def handle_index_not_found_error(action)
       return unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
       
-      # Action is [action_type, params, event_data]
-      # params contains :_index with the alias name
       if action && action[1] && action[1][:_index]
-        alias_name = action[1][:_index]
-        
+        container_name = action[1][:_index]
         logger.warn("Index not found error detected, clearing cache for next retry", 
-                    :alias => alias_name)
-        
-        # Clear cache - next retry will recreate resources
-        @dynamic_templates_created.remove(alias_name)
-      end    end
+                    :container => container_name)
+        @dynamic_templates_created.remove(container_name)
+      end
+    end
+    
     private
     
-    # Quick check if alias exists (lightweight, no exceptions)
-    def verify_alias_exists(alias_name)
+    # Check if an index exists (simple and reliable)
+    def index_exists?(index_name)
       begin
-        @client.rollover_alias_exists?(alias_name)
+        response = @client.pool.head(index_name)
+        return true
+      rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+        return false if e.response_code == 404
+        logger.warn("Error checking if index exists", :index => index_name, :error => e.message)
+        return false
       rescue => e
-        logger.debug("Error checking alias existence", :alias => alias_name, :error => e.message)
-        false
+        logger.warn("Error checking if index exists", :index => index_name, :error => e.message)
+        return false
       end
     end
     
@@ -149,11 +141,11 @@ module LogStash
       
       # Create policy
       policy_payload = build_dynamic_ilm_policy
-      @client.ilm_policy_put(policy_name, policy_payload)
-      
+      @client.ilm_policy_put(policy_name, policy_payload)      
       logger.info("Created ILM policy", :policy => policy_name)
     end
-      # Create template (idempotent - only creates if missing)
+    
+    # Create template (idempotent - only creates if missing)
     def create_template_if_missing(template_name, base_name, policy_name)
       index_pattern = "#{base_name}-*"
       
@@ -165,109 +157,50 @@ module LogStash
       endpoint = TemplateManager.send(:template_endpoint, self)
       
       # template_install is idempotent (won't overwrite existing)
-      @client.template_install(endpoint, template_name, template, false)
-      
+      @client.template_install(endpoint, template_name, template, false)      
       logger.info("Template ready", :template => template_name, :priority => priority)
-    end    # Create first index with write alias (idempotent - only creates if missing)
-    def create_index_if_missing(alias_name, policy_name)
-      # DEFENSIVE: Loop to handle auto-creation race conditions
-      max_attempts = 3
-      attempts = 0
-      
-      while attempts < max_attempts
-        attempts += 1
-        
-        # Check if alias exists
-        if @client.rollover_alias_exists?(alias_name)
-          # Alias exists - check if write index has today's date
-          write_index = get_write_index_for_alias(alias_name)
-          if write_index
-            # Extract date from index name (format: alias-YYYY.MM.DD-NNNNNN)
-            if write_index =~ /-(\d{4}\.\d{2}\.\d{2})-\d+$/
-              index_date = $1
-              today = current_date_str
-              
-              if index_date != today
-                logger.info("Write index has old date, triggering rollover", 
-                           :alias => alias_name,
-                           :current_write_index => write_index,
-                           :index_date => index_date,
-                           :today => today)
-                
-                # Force rollover to create index with today's date
-                force_rollover_with_new_date(alias_name, policy_name)
-                return
-              end
-            end
-          end
-          
-          logger.debug("Index/alias already exists with current date", :alias => alias_name)
-          return
-        end
-        
-        # Check if a simple index exists with the same name as the alias
-        # This can happen if Elasticsearch auto-created it during a brief gap
-        if simple_index_exists?(alias_name)
-          logger.warn("Found simple index with alias name - deleting and recreating properly (attempt #{attempts}/#{max_attempts})", 
-                      :index => alias_name)
-          delete_simple_index(alias_name)
-          # After deletion, loop back to re-check before creating
-          sleep 0.1  # Brief pause to let deletion propagate
-          next
-        end
-        
-        # Neither alias nor simple index exists - safe to create
-        break
-      end
-      
-      if attempts >= max_attempts
-        logger.error("Failed to clean up auto-created index after #{max_attempts} attempts", :alias => alias_name)
-        raise StandardError.new("Cannot create rollover index: auto-created index keeps reappearing")
-      end
-      
-      # Create first rollover index with date pattern
+    end    
+    # Create first index with date-based naming (idempotent)
+    def create_index_if_missing(container_name, policy_name)
       today = current_date_str
-      first_index_name = "#{alias_name}-#{today}-000001"
+      index_name = "#{container_name}-#{today}"
+      
+      # Check if today's index already exists
+      if index_exists?(index_name)
+        logger.debug("Index already exists for today", :index => index_name)
+        return
+      end
+      
+      # Create today's index with ILM policy
+      logger.info("Creating new index for container", 
+                  :container => container_name,
+                  :index => index_name,
+                  :policy => policy_name)
       
       index_payload = {
-        'aliases' => {
-          alias_name => {
-            'is_write_index' => true
-          }
-        },
         'settings' => {
           'index' => {
             'lifecycle' => {
-              'name' => policy_name,
-              'rollover_alias' => alias_name
-            }
+              'name' => policy_name
+            },
+            'number_of_shards' => (@number_of_shards || 1).to_s,
+            'number_of_replicas' => (@number_of_replicas || 0).to_s
           }
         }
       }
-        @client.rollover_alias_put(first_index_name, index_payload)
       
-      # Verify the alias was created correctly (not as a simple index)
-      if @client.rollover_alias_exists?(alias_name)
-        logger.info("Created and verified rollover index", 
-                    :index => first_index_name, 
-                    :alias => alias_name,
-                    :policy => policy_name)
-      else
-        logger.error("Rollover index creation may have failed - alias not found after creation", 
-                     :index => first_index_name,
-                     :alias => alias_name)
-      end
-    end
-    # Check if child templates exist for a base name (simple version)
-    def has_child_templates?(base_name)
       begin
-        endpoint = TemplateManager.send(:template_endpoint, self)
-        all_templates = @client.get_template(endpoint, "logstash-#{base_name}-*")
-        
-        !all_templates.nil? && !all_templates.empty?
-      rescue => e
-        logger.debug("Could not check for child templates", :error => e.message)
-        false
+        @client.pool.put(index_name, {}, LogStash::Json.dump(index_payload))
+        logger.info("Successfully created index", 
+                    :index => index_name,
+                    :container => container_name,
+                    :policy => policy_name)
+      rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+        # 400 with "resource_already_exists_exception" means index was created by another thread - that's OK
+        if e.response_code == 400 && e.message.to_s.include?('resource_already_exists')
+          logger.debug("Index already created by another thread", :index => index_name)
+        else          raise e
+        end
       end
     end
     
@@ -290,14 +223,6 @@ module LogStash
         "priority" => @ilm_hot_priority
       }
       
-      # Rollover action
-      rollover_conditions = {}
-      rollover_conditions["max_age"] = @ilm_rollover_max_age if @ilm_rollover_max_age
-      rollover_conditions["max_size"] = @ilm_rollover_max_size if @ilm_rollover_max_size
-      rollover_conditions["max_docs"] = @ilm_rollover_max_docs if @ilm_rollover_max_docs
-      
-      hot_phase["actions"]["rollover"] = rollover_conditions unless rollover_conditions.empty?
-      
       policy["policy"]["phases"]["hot"] = hot_phase
       
       # Delete phase configuration (if enabled)
@@ -309,11 +234,14 @@ module LogStash
               "delete_searchable_snapshot" => true
             }
           }
-        }
+        }        
         policy["policy"]["phases"]["delete"] = delete_phase
       end
-        policy
-    end    # Build a template for dynamic ILM indices
+      
+      policy
+    end
+    
+    # Build a template for dynamic ILM indices
     def build_dynamic_template(index_pattern, policy_name, priority = 100)
       logger.debug("Building dynamic template", 
                    :index_pattern => index_pattern, 
@@ -354,18 +282,14 @@ module LogStash
                     :policy_name => policy_name,
                     :priority => priority)
         template = create_minimal_template(index_pattern, policy_name, priority)
-      end
-      
+      end      
       template
-    end# Create a minimal index template programmatically when template files are unavailable
-    def create_minimal_template(index_pattern, policy_name, priority = 100)
-      es_major_version = maximum_seen_major_version
+    end
+    
+    # Create a minimal index template programmatically when template files are unavailable
+    def create_minimal_template(index_pattern, policy_name, priority = 100)      es_major_version = maximum_seen_major_version
       
-      # Extract alias name from pattern (remove the -* suffix)
-      alias_name = index_pattern.gsub('*', '').chomp('-')
-        # Base settings with ILM configuration
-      # NOTE: We don't set rollover_alias in the template because it requires the alias to exist
-      # Instead, the alias is set when we create the first index
+      # Base settings with ILM configuration
       base_settings = {
         "index" => {
           "lifecycle" => {
@@ -453,203 +377,16 @@ module LogStash
           "aliases" => {},
           "_meta" => {
             "description" => "Dynamically created template for ILM-managed index",
-            "created_by" => "logstash-output-elasticsearch"
-          }
+            "created_by" => "logstash-output-elasticsearch"          }
         }
-      end
-    end    # Check if a simple index (not an alias) exists with the given name
-    def simple_index_exists?(index_name)
-      begin
-        # Use GET /index_name to check if an index exists
-        response = @client.pool.get(index_name)
-        parsed = LogStash::Json.load(response.body)
-        
-        logger.debug("Simple index check response", :index => index_name, :has_data => !parsed.nil?)
-        
-        # If we get a 200 response with index details, it's a simple index
-        # Response format: { "index_name" => { "aliases" => {...}, "mappings" => {...}, "settings" => {...} } }
-        if parsed && parsed.is_a?(Hash) && parsed[index_name]
-          # Check if it has aliases field - if empty or doesn't point to write alias, it's a simple index
-          index_data = parsed[index_name]
-          aliases = index_data['aliases'] || {}
-          
-          # It's a simple index if:
-          # 1. It exists (we got here)
-          # 2. It has no aliases, OR
-          # 3. It has aliases but none with is_write_index: true
-          
-          if aliases.empty?
-            logger.warn("Found simple index (no aliases)", :index => index_name)
-            return true
-          else
-            # Check if any alias has is_write_index: true
-            has_write_alias = aliases.values.any? { |alias_def| alias_def['is_write_index'] == true }
-            if !has_write_alias
-              logger.warn("Found simple index (no write alias)", :index => index_name, :aliases => aliases.keys)
-              return true
-            end
-          end
-        end
-        
-        return false
-      rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
-        # 404 means it doesn't exist - that's fine
-        if e.response_code == 404
-          logger.debug("Index does not exist (404)", :index => index_name)
-          return false
-        end
-        # Other errors - log and assume it doesn't exist
-        logger.warn("Error checking if simple index exists", :index => index_name, :code => e.response_code, :error => e.message)
-        return false
-      rescue => e
-        logger.warn("Error checking if simple index exists", :index => index_name, :error => e.message, :backtrace => e.backtrace.first(2))
-        return false
-      end
-    end
-      # Delete a simple index (used to clean up auto-created indices)
-    def delete_simple_index(index_name)
-      begin
-        @client.pool.delete(index_name)
-        logger.info("Deleted auto-created simple index", :index => index_name)
-      rescue => e
-        logger.warn("Failed to delete simple index - will retry", 
-                    :index => index_name, 
-                    :error => e.message)
-        raise e
-      end
-    end
-
-    # Get the current write index for an alias
-    def get_write_index_for_alias(alias_name)
-      begin
-        response = @client.pool.get("_alias/#{CGI::escape(alias_name)}")
-        parsed = LogStash::Json.load(response.body)
-        
-        # Response format: { "index-name" => { "aliases" => { "alias-name" => { "is_write_index" => true } } } }
-        parsed.each do |index_name, index_data|
-          aliases = index_data['aliases'] || {}
-          if aliases[alias_name] && aliases[alias_name]['is_write_index']
-            return index_name
-          end
-        end
-        
-        nil
-      rescue => e
-        logger.warn("Error getting write index for alias", :alias => alias_name, :error => e.message)
-        nil
       end
     end
     
-    # Force a rollover to create a new index with today's date
-    def force_rollover_with_new_date(alias_name, policy_name)
-      begin
-        today = current_date_str
-        old_write = get_write_index_for_alias(alias_name)
-        new_index_name = find_next_index_name(alias_name, today)
-        logger.info("Forcing rollover to new date-based index", :alias => alias_name, :old_write_index => old_write, :new_index => new_index_name)
-        # Create new index WITHOUT alias to avoid multiple write_index conflict
-        index_payload = {
-          'settings' => {
-            'index' => {
-              'lifecycle' => {
-                'name' => policy_name,
-                'rollover_alias' => alias_name
-              }
-            }
-          }
-        }
-        @client.pool.put(new_index_name, {}, LogStash::Json.dump(index_payload))
-        # Atomically move alias write flag from old to new
-        reassign_write_alias(alias_name, old_write, new_index_name)
-        logger.info("Successfully rolled over to new date-based index", :alias => alias_name, :new_index => new_index_name)
-      rescue => e
-        logger.error("Failed to force rollover", :alias => alias_name, :error => e.message, :backtrace => e.backtrace.first(3))
-        # Cleanup if index created but alias not moved
-        begin
-          unless get_write_index_for_alias(alias_name) == new_index_name
-            @client.pool.delete(new_index_name)
-            logger.warn("Rolled back partial rollover (deleted new index)", :index => new_index_name)
-          end
-        rescue => cleanup_err
-          logger.warn("Failed cleanup after rollover error", :index => new_index_name, :error => cleanup_err.message)
-        end
-      end
-    end
-    
-    # Atomically remove alias from old index and add to new index with write flag
-    def reassign_write_alias(alias_name, old_index, new_index)
-      actions = []
-      actions << { 'remove' => { 'index' => old_index, 'alias' => alias_name } } if old_index
-      actions << { 'add' => { 'index' => new_index, 'alias' => alias_name, 'is_write_index' => true } }
-      body = { 'actions' => actions }
-      @client.pool.post('/_aliases', {}, LogStash::Json.dump(body))
-      logger.debug("Alias reassigned", :alias => alias_name, :old_index => old_index, :new_index => new_index)
-    rescue => e
-      logger.error("Failed alias reassignment", :alias => alias_name, :error => e.message)
-      raise e
-    end
-
-    # Find the next available index name for a given date
-    def find_next_index_name(alias_name, date_str)
-      begin
-        # Get all indices matching the pattern for today
-        pattern = "#{alias_name}-#{date_str}-*"
-        response = @client.pool.get("#{pattern}")
-        parsed = LogStash::Json.load(response.body)
-        
-        # Find the highest number used today
-        max_number = 0
-        parsed.keys.each do |index_name|
-          if index_name =~ /-#{Regexp.escape(date_str)}-(\d+)$/
-            number = $1.to_i
-            max_number = number if number > max_number
-          end
-        end
-        
-        # Return next number (or 000001 if none exist)
-        next_number = max_number + 1
-        "#{alias_name}-#{date_str}-#{next_number.to_s.rjust(6, '0')}"
-      rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
-        # No indices exist for today - start with 000001
-        if e.response_code == 404
-          "#{alias_name}-#{date_str}-000001"
-        else
-          raise e
-        end
-      end
-    end
-
-    # Perform a lightweight daily check to ensure the write index matches today's date
-    # If the alias points to an index with yesterday's date, force a rollover to today's index
-    def maybe_rollover_for_new_day(alias_name)
-      return unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
-
-      today = current_date_str
-      last_checked = @alias_rollover_checked_date.get(alias_name)
-      return if last_checked == today
-
-      # mark as checked for today to avoid re-checking on every batch
-      @alias_rollover_checked_date.put(alias_name, today)
-
-      write_index = get_write_index_for_alias(alias_name)
-      return unless write_index
-
-      if write_index =~ /-(\d{4}\.\d{2}\.\d{2})-\d+$/
-        index_date = $1
-        if index_date != today
-          policy_name = "#{alias_name}-ilm-policy"
-          logger.info("Detected day change; forcing rollover to today's index", alias: alias_name, from: index_date, to: today)
-          force_rollover_with_new_date(alias_name, policy_name)
-        end
-      end
-    rescue => e
-      logger.warn("Daily rollover check failed - will try again later", alias: alias_name, error: e.message)
-    end
-
     # Helper to provide consistent date formatting for index names
     def current_date_str
       Time.now.strftime("%Y.%m.%d")
     end
+    
       end
     end
   end
