@@ -6,7 +6,6 @@ module LogStash
         # Thread-safe cache to track which containers have been initialized
         def initialize_dynamic_template_cache
           @dynamic_templates_created ||= java.util.concurrent.ConcurrentHashMap.new
-          @write_alias_last_checked ||= java.util.concurrent.ConcurrentHashMap.new
         end        
         # Create ILM resources (policy, template, index) for a container
         # Called ONLY ONCE per container (first event), then cached
@@ -68,9 +67,6 @@ module LogStash
           create_template_if_missing(template_name, container_name, policy_name)
           create_index_if_missing(container_name, policy_name)
           
-          # Ensure write alias points to today's index (handles daily rollover)
-          ensure_write_alias_current(container_name, policy_name)
-          
           # Mark as successfully created
           @dynamic_templates_created.put(container_name, true)
             logger.info("ILM resources ready, lock released", 
@@ -86,96 +82,7 @@ module LogStash
                        :error => e.message,
                        :backtrace => e.backtrace.first(3))
         end
-          # Ensure the write alias points to today's index
-        # This handles daily rollover automatically
-        def ensure_write_alias_current(container_name, policy_name)
-          today = current_date_str
-          today_index = "#{container_name}-#{today}"
-          
-          # Check if we've already verified this today (cache key includes date)
-          cache_key = "#{container_name}:#{today}"
-          if @write_alias_last_checked.get(cache_key)
-            return # Already checked today
-          end
-          
-          # If today's index doesn't exist, create it
-          unless index_exists?(today_index)
-            create_index_if_missing(container_name, policy_name)
-            @write_alias_last_checked.put(cache_key, true)
-            return
-          end          
-          # Check if the write alias is already pointing to today's index
-          begin
-            response = @client.pool.get("_alias/#{container_name}")
-            response_body = LogStash::Json.load(response.body)
-            
-            # Find which index has the write alias
-            response_body.each do |index_name, data|
-              aliases = data['aliases'] || {}
-              if aliases[container_name] && aliases[container_name]['is_write_index']
-                # If write alias already points to today's index, we're done
-                if index_name == today_index
-                  @write_alias_last_checked.put(cache_key, true)
-                  return
-                end
-                
-                # Otherwise, we need to move the write alias to today's index
-                logger.info("Moving write alias to today's index",
-                           :alias => container_name,
-                           :from => index_name,
-                           :to => today_index)
-                
-                # Move the write alias atomically
-                update_write_alias(container_name, today_index)
-                @write_alias_last_checked.put(cache_key, true)
-                return
-              end
-            end
-            
-            # No write alias found - create it on today's index
-            logger.info("No write alias found, creating on today's index",
-                       :alias => container_name,
-                       :index => today_index)
-            update_write_alias(container_name, today_index)
-            @write_alias_last_checked.put(cache_key, true)
-            
-          rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
-            if e.response_code == 404
-              # Alias doesn't exist - create it
-              logger.info("Alias not found, creating on today's index",
-                         :alias => container_name,
-                         :index => today_index)
-              update_write_alias(container_name, today_index)
-              @write_alias_last_checked.put(cache_key, true)
-            else
-              logger.warn("Error checking write alias", 
-                         :alias => container_name,
-                         :error => e.message)
-            end
-          end
-        end        
-        # Update the write alias to point to a specific index
-        def update_write_alias(alias_name, target_index)
-          payload = {
-            'actions' => [
-              {
-                'add' => {
-                  'index' => target_index,
-                  'alias' => alias_name,
-                  'is_write_index' => true
-                }
-              }
-            ]
-          }
-          
-          @client.pool.post('_aliases', {}, LogStash::Json.dump(payload))
-          logger.info("Updated write alias", :alias => alias_name, :index => target_index)
-        rescue => e
-          logger.error("Failed to update write alias",
-                      :alias => alias_name,
-                      :index => target_index,
-                      :error => e.message)
-        end        
+        
         # Handle indexing errors - recreate if index is missing
         def handle_dynamic_ilm_error(container_name, error)
           return unless ilm_in_use? && @ilm_rollover_alias&.include?('%{')
@@ -210,6 +117,38 @@ module LogStash
         end
         
         private        
+        # Check if rollover alias already has a write index
+        def rollover_alias_has_write_index?(alias_name)
+          begin
+            response = @client.pool.get("_alias/#{alias_name}")
+            response_body = LogStash::Json.load(response.body)
+            
+            # Check if any index has this alias with is_write_index=true
+            response_body.each do |index_name, data|
+              aliases = data['aliases'] || {}
+              if aliases[alias_name] && aliases[alias_name]['is_write_index']
+                logger.debug("Write alias already exists", 
+                            :alias => alias_name, 
+                            :write_index => index_name)
+                return true
+              end
+            end
+            
+            return false
+          rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
+            return false if e.response_code == 404
+            logger.warn("Error checking if rollover alias exists", 
+                       :alias => alias_name, 
+                       :error => e.message)
+            return false
+          rescue => e
+            logger.warn("Error checking if rollover alias exists", 
+                       :alias => alias_name, 
+                       :error => e.message)
+            return false
+          end
+        end
+        
         # Check if an index exists (simple and reliable)
         def index_exists?(index_name)
           begin
@@ -252,21 +191,22 @@ module LogStash
           @client.template_install(endpoint, template_name, template, false)      
           logger.info("Template ready", :template => template_name, :priority => priority)
         end        
-        # Create first index with date-based naming (idempotent)
+        # Create first rollover index without date (ILM-managed with auto-increment)
+        # Index pattern: auto-nginx-000001, auto-nginx-000002, etc.
         def create_index_if_missing(container_name, policy_name)
-          today = current_date_str
-          index_name = "#{container_name}-#{today}"
-          
-          # Check if today's index already exists
-          if index_exists?(index_name)
-            logger.debug("Index already exists for today", :index => index_name)
-            return index_name
+          # Check if the alias already has a write index
+          if rollover_alias_has_write_index?(container_name)
+            logger.debug("Write alias already exists", :alias => container_name)
+            return
           end
           
-          # Create today's index with ILM policy AND write alias
-          logger.info("Creating new index for container", 
+          # Create first rollover index: container_name-000001
+          # ILM will handle subsequent rollovers (000002, 000003, etc.)
+          first_index_name = "#{container_name}-000001"
+          
+          logger.info("Creating first rollover index for container", 
                       :container => container_name,
-                      :index => index_name,
+                      :index => first_index_name,
                       :policy => policy_name)
           
           # Configure both settings AND alias in a single request
@@ -274,15 +214,16 @@ module LogStash
             'settings' => {
               'index' => {
                 'lifecycle' => {
-                  'name' => policy_name
+                  'name' => policy_name,
+                  'rollover_alias' => container_name
                 },
                 'number_of_shards' => (@number_of_shards || 1).to_s,
                 'number_of_replicas' => (@number_of_replicas || 0).to_s
               }
             },
             'aliases' => {
-              # Create write alias pointing to this index
-              # This allows events to be sent to "auto-uibackend" and be routed to the current day's index
+              # Create write alias pointing to this first index
+              # ILM will automatically update this to point to new indices during rollover
               container_name => {
                 'is_write_index' => true
               }
@@ -290,22 +231,24 @@ module LogStash
           }
           
           begin
-            @client.pool.put(index_name, {}, LogStash::Json.dump(index_payload))
-            logger.info("Successfully created index with write alias", 
-                        :index => index_name,
+            # Use rollover_alias_put method for proper ILM setup
+            @client.rollover_alias_put(first_index_name, index_payload)
+            logger.info("Successfully created first rollover index with write alias", 
+                        :index => first_index_name,
                         :alias => container_name,
                         :container => container_name,
                         :policy => policy_name)
-            return index_name
+            return first_index_name
           rescue ::LogStash::Outputs::ElasticSearch::HttpClient::Pool::BadResponseCodeError => e
             # 400 with "resource_already_exists_exception" means index was created by another thread - that's OK
             if e.response_code == 400 && e.message.to_s.include?('resource_already_exists')
-              logger.debug("Index already created by another thread", :index => index_name)
-              return index_name
+              logger.debug("Index already created by another thread", :index => first_index_name)
+              return first_index_name
             else
               raise e
             end
-          end        end
+          end
+        end
         
         # Build ILM policy payload based on configuration
         def build_dynamic_ilm_policy
@@ -315,10 +258,24 @@ module LogStash
             }
           }
           
-          # Hot phase configuration
+          # Hot phase configuration with rollover conditions
           hot_phase = {
-            "min_age" => "0ms",            "actions" => {}
+            "min_age" => "0ms",
+            "actions" => {}
           }
+          
+          # Add rollover action with configured conditions
+          rollover_conditions = {}
+          rollover_conditions["max_age"] = @ilm_rollover_max_age if @ilm_rollover_max_age
+          rollover_conditions["max_size"] = @ilm_rollover_max_size if @ilm_rollover_max_size
+          rollover_conditions["max_docs"] = @ilm_rollover_max_docs if @ilm_rollover_max_docs
+          
+          # Ensure at least one rollover condition is set
+          if rollover_conditions.empty?
+            rollover_conditions["max_age"] = "1d"  # Default fallback
+          end
+          
+          hot_phase["actions"]["rollover"] = rollover_conditions
           
           # Set priority
           hot_phase["actions"]["set_priority"] = {
@@ -483,11 +440,6 @@ module LogStash
               }
             }
           end
-        end
-        
-        # Helper to provide consistent date formatting for index names
-        def current_date_str
-          Time.now.strftime("%Y.%m.%d")
         end
         
       end
